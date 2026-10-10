@@ -1653,3 +1653,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 - 交付面 = `mit-534-bmi2` `f10dd53` + 修复枚。+3 VmOp native 直发（kVmOpMax 169），[bmi2] require 开关（默认 true，用户批准 BMI2 最低机器契约），require_avx 闭区间化，G8a 负例族翻正。⚠️ 两大实录坑：keystone 裸立即数 16 进制读（add rsp,16→0x16 非确定崩）；mulx 语序汇编器分叉（keystone/ML64 首=高位 vs MSVC 代码生成器首=低位，2×3=6 探针定谳）。E2E reg 形三连 byte-exact + intrinsic mem 形如实 gate。样本入池 77→78。**全池 390/390**。验收 PASS 零 F。证据链 GAPS「MIT-534」节。
 
 > 追记（2026-09-28 · **MIT-532/533/534 会话直做批第二辑**，叠枝 ff 合入 main c5bd198）：用户四项裁决落地完毕——BMI2 通路 A（默认开）/只立项桥/Intel mulx 维持挂账/x86 IAT 工具门立项修复。tls_e2e 首次全绿（C2 起在案工具债清偿）。kVmOpMax 169/跳表 256。待用户：Intel 真机 mulx（挂账非阻塞）；新挂账：mulx/pdep/pext mem 形（408 通路同款）、mulx dst1==dst2 形披露。
+
+### MIT-541 (水印溯源 v1) ✅ 2026-10-10
+- 交付面 = 分支 `mit-541-watermark`。四件套：common wm 核心库（validate/compile/StreamMatcher，VMProtect 移植钉板）+ [watermark]/--watermark 配置面 + pe_writer 尾垫嵌入（槽缺席=byte-exact 零扰动；预算不足扩 raw 一档再 fail-closed）+ `wvmp scan` 反查子命令 + 发行台账 TSV（sha256 取证指纹，common/sha256 新增 FIPS 180-4）。ctest 25→26 全绿；E2E 六面（嵌入/反查/多态/零误报/行为一致/台账）；10MB×100 枚误匹配实证零命中。局限如实披露（差分攻击同 VMProtect；台账离库；不做运行时自校验）。M2 挂账：碎片分散 + mutate 立即数嵌入。证据链 GAPS「MIT-541」节。

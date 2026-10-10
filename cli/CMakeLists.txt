@@ -6,6 +6,7 @@
 add_library(wvmp_cli_core
     src/config.cpp
     src/args.cpp
+    src/scan.cpp
 )
 add_library(wvmp::cli_core ALIAS wvmp_cli_core)
 target_include_directories(wvmp_cli_core PUBLIC
@@ -37,6 +38,7 @@ if(WVMP_BUILD_TESTS)
     add_executable(wvmp_cli_tests
         tests/test_config.cpp
         tests/test_args.cpp
+        tests/test_watermark_cli.cpp
     )
     target_link_libraries(wvmp_cli_tests PRIVATE
         wvmp::cli_core

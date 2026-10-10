@@ -44,4 +44,9 @@ inline constexpr std::string_view kTlsPlan="tls.plan";
 // 消费，TLS 回调内回填原 IAT 区）。契约模型见 passes/import_protect/
 // include/wvmp/passes/import_protect/import_plan.hpp。
 inline constexpr std::string_view kImportPlan="import.plan";
+// MIT-541 水印溯源 v1：嵌入计划（CLI 解析 [watermark]/--watermark 后写入
+// → pe_writer 在新节尾垫嵌入）。类型 wvmp::wm::WatermarkPlan（见 common/
+// include/wvmp/wm/watermark.hpp）。槽缺席 = 不嵌入，输出与无水印现状
+// byte-exact 一致（缺省零扰动契约）。
+inline constexpr std::string_view kWatermark="watermark.plan";
 }

@@ -1,5 +1,7 @@
 #include "wvmp/cli/config.hpp"
 
+#include "wvmp/wm/watermark.hpp"
+
 #include <toml++/toml.hpp>
 
 #include <cctype>
@@ -124,7 +126,7 @@ ConfigResult parse_config(const std::filesystem::path& file) {
                                                   "default_level", "functions", "passes",
                                                   "avx", "bmi2",
                                                   "mutate", "anti_debug", "tls", "crypt",
-                                                  "import", "pe"};
+                                                  "import", "pe", "watermark"};
     for (const auto& [key, value] : tbl) {
         bool known = false;
         for (auto k : kTopLevelKeys)
@@ -488,6 +490,137 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         result.value.rules.pe_aslr = *aslr;
     }
 
+    // [watermark]（MIT-541 水印溯源 v1）：id/copy 份/台账路径可省略，
+    // value 必填；值域校验见 wm::validate（固定位下限 = 扫描误匹配兜底）。
+    if (const toml::node* wm_node = tbl.get("watermark")) {
+        const toml::table* wt = wm_node->as_table();
+        if (!wt) return fail("config 字段 'watermark' 必须是表（[watermark]）");
+        for (const auto& [key, value] : *wt)
+            if (key.str() != "id" && key.str() != "value" && key.str() != "copies" &&
+                key.str() != "issue_log")
+                return fail("config [watermark] 未知子键 '" + std::string(key.str()) +
+                            "'（允许: id/value/copies/issue_log）");
+        WatermarkConfig wc;
+        auto v = (*wt)["value"].value<std::string>();
+        if (!v || v->empty())
+            return fail("config [watermark] 缺少必填子键 'value'（十六进制 + '?' "
+                        "通配符，16-64 字符）");
+        wc.value = *v;
+        if (const toml::node* idn = wt->get("id")) {
+            auto id = idn->value<std::string>();
+            if (!id || id->empty())
+                return fail("config [watermark] 'id' 必须是非空字符串");
+            wc.id = *id;
+        }
+        if (const toml::node* cn = wt->get("copies")) {
+            auto copies = cn->value<std::int64_t>();
+            if (!copies || *copies < 1 || *copies > 8)
+                return fail("config [watermark] 'copies' 必须是 1-8 的整数（嵌入份数）");
+            wc.copies = static_cast<u32>(*copies);
+        }
+        if (const toml::node* iln = wt->get("issue_log")) {
+            auto il = iln->value<std::string>();
+            if (!il || il->empty())
+                return fail("config [watermark] 'issue_log' 必须是非空字符串（台账路径）");
+            wc.has_issue_log = true;
+            wc.issue_log = *il;
+        }
+        if (wc.id.empty()) wc.id = wc.value.substr(0, 8);
+        std::string why;
+        if (!wvmp::wm::validate(wc.id, wc.value, &why))
+            return fail("config [watermark] " + why);
+        result.value.has_watermark = true;
+        result.value.watermark = std::move(wc);
+    }
+
+    result.ok = true;
+    return result;
+}
+
+WatermarkRegistryResult parse_watermark_registry(const std::filesystem::path& file) {
+    WatermarkRegistryResult result;
+    // 同 parse_config 的 MSYS 路径回退（scripts/e2e.sh 类调用方）。
+    std::filesystem::path actual = file;
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(actual, ec)) {
+            ec.clear();
+            std::filesystem::path converted = msys_to_windows_path(file);
+            if (!converted.empty() && std::filesystem::exists(converted, ec)) {
+                actual = converted;
+                ec.clear();
+            } else {
+                result.error = "registry 文件不存在: " + file.string();
+                return result;
+            }
+        }
+    }
+    toml::table tbl;
+    try {
+        tbl = toml::parse_file(actual.string());
+    } catch (const toml::parse_error& err) {
+        result.error = describe_parse_error(err);
+        return result;
+    }
+    const toml::node* arr_node = tbl.get("watermarks");
+    if (arr_node == nullptr) {
+        result.error = "registry 缺少 [[watermarks]] 数组";
+        return result;
+    }
+    const toml::array* arr = arr_node->as_array();
+    if (arr == nullptr) {
+        result.error = "registry 字段 'watermarks' 必须是表数组（[[watermarks]]）";
+        return result;
+    }
+    size_t index = 0;
+    for (const toml::node& elem : *arr) {
+        const toml::table* entry = elem.as_table();
+        if (!entry) {
+            result.error =
+                "registry 'watermarks[" + std::to_string(index) + "]' 必须是表";
+            return result;
+        }
+        const auto where =
+            "registry 'watermarks[" + std::to_string(index) + "]'";
+        // 严格 schema（同 [[passes]] 口径）。
+        for (const auto& [key, value] : *entry) {
+            if (key.str() != "id" && key.str() != "value") {
+                result.error = where + " 未知字段 '" + std::string(key.str()) +
+                               "'（只允许 id/value）";
+                return result;
+            }
+        }
+        auto id = (*entry)["id"].value<std::string>();
+        auto val = (*entry)["value"].value<std::string>();
+        if (!id || id->empty()) {
+            result.error = where + " 缺少必填字段 'id'（非空字符串）";
+            return result;
+        }
+        if (!val || val->empty()) {
+            result.error = where + " 缺少必填字段 'value'（十六进制 + '?')";
+            return result;
+        }
+        std::string why;
+        if (!wvmp::wm::validate(*id, *val, &why)) {
+            result.error = where + " " + why;
+            return result;
+        }
+        wvmp::wm::Watermark wm;
+        wm.id = *id;
+        wm.value = *val;
+        try {
+            wm.compile();
+        } catch (const std::exception& e) {
+            result.error = where + " " + e.what();
+            return result;
+        }
+        result.items.push_back(std::move(wm));
+        ++index;
+    }
+    if (result.items.empty()) {
+        result.error = "registry [[watermarks]] 为空（至少登记一枚水印）";
+        return result;
+    }
     result.ok = true;
     return result;
 }

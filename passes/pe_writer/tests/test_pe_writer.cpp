@@ -13,6 +13,7 @@
 #include "wvmp/framework/context.hpp"
 #include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/protect_levels.hpp"
+#include "wvmp/wm/watermark.hpp"
 
 #include <gtest/gtest.h>
 
@@ -906,4 +907,154 @@ TEST(PeWriterPublish, ReadbackCatchesTruncatedAndOverlong) {
 
     std::error_code ec;
     fs::remove_all(dir, ec);
+}
+
+// —— MIT-541 水印溯源 v1：嵌入面 ——————————————————————————————————
+
+// 夹具：最小 PE + 单个 .wvmp 新节（payload_size 可调）。落位可预测：
+// raw 起点 = align_up(0x400, 0x200) = 0x400（.text 之后），padding 区 =
+// [0x400 + payload, 0x400 + align_up(payload, 0x200))。
+static void make_wm_fixture(ProtectionContext& ctx, size_t payload_size,
+                            const fs::path& out) {
+    ctx.image = build_minimal_pe(true, kMachineX64);
+    ctx.output_path = out;
+    wvmp::passes::NewSection sec;
+    sec.name = ".wvmp";
+    sec.data.assign(payload_size, 0);
+    sec.requested_rva = 0x2000u;
+    sec.characteristics = 0xC0000040u;
+    ctx.slot<std::vector<wvmp::passes::NewSection>>(wvmp::kNewSections)
+        .push_back(std::move(sec));
+}
+
+static wvmp::wm::WatermarkPlan make_wm_plan(u32 copies) {
+    wvmp::wm::WatermarkPlan plan;
+    plan.watermark.id = "Customer_A";
+    plan.watermark.value = "4D5A90??11223344";
+    plan.watermark.compile();
+    plan.copies = copies;
+    return plan;
+}
+
+TEST(PeWriterPass, WatermarkSlotAbsentKeepsOutputByteExactVsBaseline) {
+    // 缺省零扰动契约：同一夹具跑两遍（同 seed，均不带 kWatermark 槽），
+    // 逐字节一致；且镜像尺寸 = 落位表期望（0x400 + 0x2200），无任何
+    // 意外增长。带槽与不带槽的差异区间断言见下一枚测试。
+    const fs::path out1 = temp_dir() / "wm_absent1.exe";
+    const fs::path out2 = temp_dir() / "wm_absent2.exe";
+    ProtectionContext c1, c2;
+    make_wm_fixture(c1, 0x2100, out1);
+    make_wm_fixture(c2, 0x2100, out2);
+    c1.rng.reseed(7);
+    c2.rng.reseed(7);
+    wvmp::passes::PeWriterPass writer;
+    writer.run(c1);
+    writer.run(c2);
+    ASSERT_EQ(c1.image.size(), c2.image.size());
+    EXPECT_EQ(0, std::memcmp(c1.image.data(), c2.image.data(), c1.image.size()));
+    // 0x400（.text 后首个 raw 起点）+ align_up(0x2100, 0x200)=0x2200。
+    EXPECT_EQ(c1.image.size(), size_t(0x400 + 0x2200));
+}
+
+TEST(PeWriterPass, WatermarkEmbedConfinedToPaddingAndFindable) {
+    // 带槽：差异只允许落在 .wvmp 尾垫 [0x400+0x2100, 0x400+0x2200)；
+    // 扫描器按 dump/mask 命中 >= copies；通配位物理字节 != dump 的 0。
+    const fs::path base = temp_dir() / "wm_diff_base.exe";
+    const fs::path out = temp_dir() / "wm_diff_out.exe";
+    ProtectionContext base_ctx, wm_ctx;
+    make_wm_fixture(base_ctx, 0x2100, base);
+    make_wm_fixture(wm_ctx, 0x2100, out);
+    base_ctx.rng.reseed(7);
+    wm_ctx.rng.reseed(7);
+    wvmp::passes::PeWriterPass writer;
+    writer.run(base_ctx);
+    const wvmp::wm::WatermarkPlan plan = make_wm_plan(3);
+    wm_ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+    writer.run(wm_ctx);
+
+    ASSERT_EQ(base_ctx.image.size(), wm_ctx.image.size());
+    // 差异只允许两类位置：尾垫 [0x400+0x2100, 0x400+0x2200) 与 checksum
+    // 字段（内容不同 → 校验和必然不同，属派生差异非嵌入越界）。
+    for (size_t i = 0; i < base_ctx.image.size(); ++i) {
+        if (base_ctx.image[i] != wm_ctx.image[i]) {
+            const bool in_checksum = i >= kChkOff && i < kChkOff + 4;
+            const bool in_padding =
+                i >= size_t(0x400 + 0x2100) && i < size_t(0x400 + 0x2200);
+            ASSERT_TRUE(in_checksum || in_padding)
+                << "水印差异越界到功能区 @0x" << std::hex << i;
+        }
+    }
+    const auto hits = wvmp::wm::scan_bytes(
+        plan.watermark, wm_ctx.image.data(), wm_ctx.image.size());
+    EXPECT_GE(hits.count, size_t(plan.copies));
+
+    // 通位填充实证：命中区间内第 4 字节（整字节通配）应几乎必有非零值
+    // （3 份 × 全 0 的概率 = 256^-3，确定性 rng 下直接抽查首命中）。
+    ASSERT_FALSE(hits.offsets.empty());
+    const size_t end = hits.offsets[0];
+    EXPECT_NE(wm_ctx.image[end - 4], 0x00)
+        << "通配位未按 rng 填充（仍为 dump 的 0）";
+}
+
+TEST(PeWriterPass, WatermarkBudgetExtensionGrowsLastSection) {
+    // payload = 0x200 恰对齐 → 原生尾垫为 0，预算路径走扩容：最后新节
+    // raw +0x200（文件总长随之 +0x200），扫描仍命中 copies 份。
+    const fs::path out = temp_dir() / "wm_extend.exe";
+    ProtectionContext ctx;
+    make_wm_fixture(ctx, 0x200, out);
+    ctx.rng.reseed(7);
+    const wvmp::wm::WatermarkPlan plan = make_wm_plan(3);
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+    // 0x400 + 0x200（原 raw）+ 0x200（扩容一档）。
+    EXPECT_EQ(ctx.image.size(), size_t(0x400 + 0x400));
+    // 节表 SizeOfRawData 已同步（表项 = 第 2 个：nt+24+opt(240) + 1*40）。
+    const size_t sh = kNt + 24 + 240 + 40;
+    EXPECT_EQ(rd32(ctx.image, sh + 16), 0x400u);
+    const auto hits = wvmp::wm::scan_bytes(
+        plan.watermark, ctx.image.data(), ctx.image.size());
+    EXPECT_GE(hits.count, size_t(plan.copies));
+}
+
+TEST(PeWriterPass, WatermarkWithoutNewSectionsFailsClosed) {
+    // fail-closed：槽在场但没有新节 → 显式失败（不静默丢水印）。
+    ProtectionContext ctx;
+    ctx.image = build_minimal_pe(true, kMachineX64);
+    ctx.output_path = temp_dir() / "wm_nosec.exe";
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = make_wm_plan(1);
+    wvmp::passes::PeWriterPass writer;
+    EXPECT_THROW(writer.run(ctx), std::runtime_error);
+    EXPECT_TRUE(ctx.diag.has_errors());
+}
+
+TEST(PeWriterPass, WatermarkDeterministicPerSeedSameIdDifferentBytes) {
+    // 同 seed → 逐字节可复现；换 seed → 同一 dump/mask 身份、不同物理
+    // 字节（多态水印语义的单元级实证）。
+    const fs::path outA = temp_dir() / "wm_seed7.exe";
+    const fs::path outB = temp_dir() / "wm_seed7_again.exe";
+    const fs::path outC = temp_dir() / "wm_seed8.exe";
+    ProtectionContext cA, cB, cC;
+    make_wm_fixture(cA, 0x2100, outA);
+    make_wm_fixture(cB, 0x2100, outB);
+    make_wm_fixture(cC, 0x2100, outC);
+    cA.rng.reseed(7);
+    cB.rng.reseed(7);
+    cC.rng.reseed(8);
+    const wvmp::wm::WatermarkPlan plan = make_wm_plan(3);
+    cA.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+    cB.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+    cC.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+    wvmp::passes::PeWriterPass writer;
+    writer.run(cA);
+    writer.run(cB);
+    writer.run(cC);
+    EXPECT_EQ(0, std::memcmp(cA.image.data(), cB.image.data(), cA.image.size()));
+    EXPECT_NE(0, std::memcmp(cA.image.data(), cC.image.data(), cA.image.size()));
+    const auto hit7 = wvmp::wm::scan_bytes(plan.watermark, cA.image.data(),
+                                           cA.image.size());
+    const auto hit8 = wvmp::wm::scan_bytes(plan.watermark, cC.image.data(),
+                                           cC.image.size());
+    EXPECT_GE(hit7.count, size_t(plan.copies));
+    EXPECT_GE(hit8.count, size_t(plan.copies));
 }

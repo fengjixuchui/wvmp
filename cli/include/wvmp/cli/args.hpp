@@ -4,7 +4,8 @@
 // 不碰文件系统。argv[0] 为程序名，跳过。
 //
 // 用法：
-//   wvmp protect --config <file> [-o <output>] [--dry-run]
+//   wvmp protect --config <file> [-o <output>] [--watermark <hex>] [--dry-run]
+//   wvmp scan --in <file> --registry <toml> [--quiet]   (MIT-541 水印溯源)
 //   wvmp version
 #pragma once
 
@@ -18,6 +19,13 @@ struct ArgsResult {
     std::string config_path;     // protect: --config 的值
     std::string output_override; // protect: -o 的值（空 = 不覆盖）
     bool dry_run = false;        // protect: --dry-run
+    // MIT-541：protect 的水印值覆盖（空 = 用配置里的 [watermark]）。
+    std::string watermark_override;
+    // MIT-541：scan 子命令（泄露副本 → 水印 ID 反查）。
+    bool is_scan = false;
+    std::string scan_input;    // --in 的值
+    std::string scan_registry; // --registry 的值
+    bool scan_quiet = false;   // --quiet
     std::string error;           // 失败描述（含 usage，可直接打印）
 };
 

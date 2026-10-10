@@ -47,3 +47,6 @@ scripts/__pycache__/
 /cl_shift_e2e.txt
 /popcnt_test.asm
 Testing/
+
+# MIT-541 水印溯源 v1：发行台账（含全部水印明文，属用户本地资产，严禁入库）
+watermark_issues.tsv

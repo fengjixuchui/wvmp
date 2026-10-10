@@ -12,6 +12,7 @@
 #include "wvmp/framework/registry.hpp"
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/tls_hook/tls_plan.hpp"
+#include "wvmp/wm/watermark.hpp"
 
 #include <cstdio>
 #include <map>
@@ -95,6 +96,16 @@ void PeWriterPass::run(ProtectionContext& ctx) {
 
     if (ctx.image.empty()) fail(ctx, "镜像为空，没有可写出的内容");
     if (ctx.output_path.empty()) fail(ctx, "输出路径为空");
+
+    // MIT-541 fail-closed：配置了水印但没有新节可承载 → 显式失败。静默
+    // 丢水印 = 溯源断链，比失败更糟（下游以为副本可追溯）。
+    if (ctx.has_slot(kWatermark)) {
+        const auto* wm_secs =
+            ctx.find_slot<std::vector<NewSection>>(kNewSections);
+        if (wm_secs == nullptr || wm_secs->empty())
+            fail(ctx, "配置了水印但管道没有新节产出（无尾垫可嵌入）——"
+                      "拒绝产出无水印副本");
+    }
 
     // MIT-491 (T23，MIT-476 观察项落地)：Emit 预留区高水位观测——使用
     // 超过 75% 预算打 Note（协议超限本身是 emit_reserve_take 硬失败，
@@ -389,12 +400,116 @@ void PeWriterPass::run(ProtectionContext& ctx) {
             sec_align = meta->section_alignment != 0 ? meta->section_alignment : sec_align;
             file_align = meta->file_alignment != 0 ? meta->file_alignment : file_align;
         }
+        std::vector<SectionPlacement> placed;
         try {
-            const auto placed = add_sections(ctx.image, *new_sections, sec_align, file_align);
+            placed = add_sections(ctx.image, *new_sections, sec_align, file_align);
             ctx.diag.report(Severity::Note, name(),
                             "已追加 " + std::to_string(placed.size()) + " 个新节");
         } catch (const std::exception& e) {
             fail(ctx, std::string("追加新节失败: ") + e.what());
+        }
+
+        // 1.5) MIT-541 水印嵌入：新节尾垫（SizeOfRawData 对齐产生的零
+        // 填充区，VirtualSize 之外、无功能字节）内分散嵌入 copies 份。
+        // 槽缺席 = 不嵌入（缺省零扰动契约）。通配 nibble 从 ctx.rng
+        // 现场填充——同 seed 可复现，不同副本物理字节互异而 dump/mask
+        // 身份不变。位于 checksum 重算之前，水印字节被校验和覆盖。
+        // fail() 抛出的错误不得被上面的 add_sections catch 吞改写，故
+        // 整段在 try 外。
+        if (auto* plan = ctx.find_slot<wm::WatermarkPlan>(kWatermark)) {
+            const size_t pattern_len = plan->watermark.dump.size();
+            if (pattern_len == 0)
+                fail(ctx, "水印计划 dump 为空（compile 未执行？）");
+
+            // 尾垫区间池：每节 [data 末端, raw 末端)。
+            struct Span { size_t off, len; };
+            std::vector<Span> spans;
+            for (size_t i = 0; i < placed.size(); ++i) {
+                const size_t b = size_t(placed[i].file_offset) +
+                                 new_sections->at(i).data.size();
+                const size_t e = size_t(placed[i].file_offset) +
+                                 placed[i].raw_size;
+                if (e > b && e - b >= pattern_len)
+                    spans.push_back({b, e - b});
+            }
+            // 预算不足 → 最后一个新节 raw 增一档 file_align（raw >
+            // virtual 合法，多出的文件字节不映射进内存；≤8 份 × ≤32
+            // 字节 = ≤256 字节，一档 0x200 恒够，仍不足则 fail）。
+            size_t pool = 0;
+            for (const auto& s : spans) pool += s.len;
+            if (pool < size_t(plan->copies) * pattern_len) {
+                const size_t last = placed.size() - 1;
+                const size_t nt = size_t(ctx.image[0x3C]) |
+                                  (size_t(ctx.image[0x3D]) << 8) |
+                                  (size_t(ctx.image[0x3E]) << 16) |
+                                  (size_t(ctx.image[0x3F]) << 24);
+                const u16 num_sections =
+                    u16(ctx.image[nt + 6]) | (u16(ctx.image[nt + 7]) << 8);
+                const size_t table = nt + 24 +
+                    (size_t(ctx.image[nt + 20]) | (size_t(ctx.image[nt + 21]) << 8));
+                const size_t entry = table + (size_t(num_sections) - 1) * 40;
+                const u32 old_raw = placed[last].raw_size;
+                const u32 new_raw = old_raw + file_align;
+                if (size_t(placed[last].file_offset) + old_raw != ctx.image.size())
+                    fail(ctx, "尾垫扩容前置断言失败：最后新节不在文件末端");
+                ctx.image.resize(size_t(placed[last].file_offset) + new_raw, 0);
+                // SizeOfRawData（表项 +16）。
+                ctx.image[entry + 16] = u8(new_raw);
+                ctx.image[entry + 17] = u8(new_raw >> 8);
+                ctx.image[entry + 18] = u8(new_raw >> 16);
+                ctx.image[entry + 19] = u8(new_raw >> 24);
+                placed[last].raw_size = new_raw;
+                const size_t b = size_t(placed[last].file_offset) +
+                                 new_sections->at(last).data.size();
+                const size_t e = size_t(placed[last].file_offset) + new_raw;
+                if (e > b && e - b >= pattern_len)
+                    spans.push_back({b, e - b});
+                pool = 0;
+                for (const auto& s : spans) pool += s.len;
+                if (pool < size_t(plan->copies) * pattern_len)
+                    fail(ctx, "水印嵌入预算不足（尾垫 " + std::to_string(pool) +
+                                  " 字节 < " +
+                                  std::to_string(size_t(plan->copies) * pattern_len) +
+                                  "）；拒绝产出未嵌全的水印副本");
+            }
+
+            // copies 份轮转分配到各 span；同 span 内按份数均分槽位
+            // （槽位互不重叠由构造保证；槽内起点 rng 取）。
+            const size_t per_span_max =
+                (size_t(plan->copies) + spans.size() - 1) / spans.size();
+            for (const auto& s : spans)
+                if (s.len / per_span_max < pattern_len)
+                    fail(ctx, "水印嵌入预算不足（span " + std::to_string(s.off) +
+                                  " 槽位 " + std::to_string(s.len / per_span_max) +
+                                  " < 模式 " + std::to_string(pattern_len) + "）");
+            std::string where;
+            for (size_t k = 0; k < size_t(plan->copies); ++k) {
+                const size_t si = k % spans.size();
+                const size_t idx = k / spans.size();
+                const size_t slot_len = spans[si].len / per_span_max;
+                const size_t slot_begin = spans[si].off + idx * slot_len;
+                const size_t start = size_t(ctx.rng.uniform(
+                    u64(slot_begin), u64(slot_begin + slot_len - pattern_len)));
+                // 填充版模式：固定位按 dump，通配 nibble 取 rng。
+                for (size_t i = 0; i < pattern_len; ++i) {
+                    u8 byte = plan->watermark.dump[i];
+                    const u8 m = plan->watermark.mask[i];
+                    if ((m & 0xF0) == 0)
+                        byte = u8((byte & 0x0F) | (u8(ctx.rng.next() & 0xF) << 4));
+                    if ((m & 0x0F) == 0)
+                        byte = u8((byte & 0xF0) | u8(ctx.rng.next() & 0xF));
+                    ctx.image[start + i] = byte;
+                }
+                char ob[24];
+                std::snprintf(ob, sizeof(ob), "%llX",
+                              static_cast<unsigned long long>(start));
+                if (!where.empty()) where += ", ";
+                where += "file_off 0x" + std::string(ob);
+            }
+            ctx.diag.report(Severity::Note, name(),
+                            "水印已嵌入 " + std::to_string(plan->copies) +
+                                " 份（id=" + plan->watermark.id + "，模式 " +
+                                std::to_string(pattern_len) + " 字节）@ " + where);
         }
         // 节表变化后 NT 头偏移不变（只动表项与文件尾），但保险起见重取模型
         // 中的对齐/偏移用于后续 checksum。
