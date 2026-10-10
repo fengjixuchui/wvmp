@@ -30,3 +30,7 @@ name = "pe_writer"
 #   copies = 3                     # 嵌入份数 1-8（抗局部篡改冗余）
 #   issue_log = "watermark_issues.tsv"  # 发行台账（TSV；泄露后 wvmp scan 反查）
 # 泄露副本反查：wvmp scan --in leaked.exe --registry watermarks.toml
+#   mode     = "padding"       # padding(默认)/junk/both；junk=水印进 VM 词流
+#                              # junk-Mov imm32（须 [[functions]] crypt=false 豁免
+#                              # 载体 + 管道含 mutate + 值字节为 4 的倍数）
+#   fragments = 2              # padding 面碎片数 1-4（分散多 span，扫描多数票）

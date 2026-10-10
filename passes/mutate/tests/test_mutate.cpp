@@ -10,10 +10,13 @@
 #include "wvmp/ir/insn.hpp"
 #include "wvmp/ir/operand.hpp"
 #include "wvmp/ir/region.hpp"
+#include "wvmp/passes/pe_loader/pe_image.hpp"
+#include "wvmp/wm/watermark.hpp"
 
 #include <gtest/gtest.h>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -304,4 +307,157 @@ TEST(MutatePass, EmptyBlocksNoop) {
     ASSERT_FALSE(ctx.functions[0].blocks.empty());
     EXPECT_TRUE(ctx.functions[0].blocks[0].insns.empty());
     EXPECT_FALSE(ctx.diag.has_errors());
+}
+
+// —— MIT-541 M2：junk-Mov 水印载体 ——————————————————————————————
+
+namespace {
+
+// 载体规则：name="wm_fn" crypt=false（其余默认全加密）。
+wvmp::ProtectRules carrier_rules(bool exempt) {
+    wvmp::ProtectRules r;
+    if (exempt) {
+        wvmp::FunctionProtectRule rule;
+        rule.has_name = true;
+        rule.name = "wm_fn";
+        rule.has_crypt = true;
+        rule.crypt = false;
+        r.functions.push_back(rule);
+    }
+    // junk 100% / nop 0%：每个死边界必发一个 junk-Mov（r8..r15 全程死）。
+    r.has_mutate_junk_density = true;
+    r.mutate_junk_density = 100;
+    r.has_mutate_density = true;
+    r.mutate_density = 0;
+    return r;
+}
+
+wvmp::wm::WatermarkPlan junk_plan() {
+    wvmp::wm::WatermarkPlan p;
+    p.watermark.id = "T";
+    p.watermark.value = "4D5A9011223344FF";  // 8B → 2 块
+    p.watermark.compile();
+    p.mode = wvmp::wm::WatermarkMode::Junk;
+    p.copies = 3;
+    return p;
+}
+
+// 块值打包（与 mutate 的 wm_materialize 同构：dump[0] = imm 低字节）。
+wvmp::u32 chunk_word(const wvmp::wm::Fragment& f) {
+    wvmp::u32 v = 0;
+    for (int b = 0; b < 4; ++b)
+        v |= wvmp::u32(f.dump[size_t(b)]) << (8 * b);
+    return v;
+}
+wvmp::u32 chunk_mask_word(const wvmp::wm::Fragment& f) {
+    wvmp::u32 v = 0;
+    for (int b = 0; b < 4; ++b)
+        v |= wvmp::u32(f.mask[size_t(b)]) << (8 * b);
+    return v;
+}
+
+} // namespace
+
+TEST(MutateWatermark, JunkChunksCarriedInExemptFunction) {
+    const auto prog = chain_program(20);
+    wvmp::ProtectionContext ctx;
+    ctx.seed = 12345;
+    ctx.functions.push_back(make_fn("wm_fn", prog, 0x1000));
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = carrier_rules(true);
+    const wvmp::wm::WatermarkPlan plan = junk_plan();
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+
+    wvmp::passes::MutatePass pass;
+    ASSERT_NO_THROW(pass.run(ctx));
+
+    const auto chunks = wvmp::wm::split_fragments(
+        plan.watermark, plan.watermark.dump.size() / 4, 4);
+    ASSERT_EQ(chunks.size(), 2u);
+    // 每块至少 1 份：存在掩码匹配的 junk imm。
+    for (const auto& f : chunks) {
+        bool found = false;
+        for (const auto& b : ctx.functions[0].blocks)
+            for (const auto& i : b.insns)
+                if (i.op == wvmp::ir::Op::Mov &&
+                    i.src.kind == wvmp::ir::Operand::Kind::Imm &&
+                    (wvmp::u32(i.src.imm) & chunk_mask_word(f)) ==
+                        (chunk_word(f) & chunk_mask_word(f)))
+                    found = true;
+        EXPECT_TRUE(found) << "块 " << f.src_off << " 未被任何 junk imm 携带";
+    }
+}
+
+TEST(MutateWatermark, NoExemptFunctionFailsClosed) {
+    const auto prog = chain_program(20);
+    wvmp::ProtectionContext ctx;
+    ctx.seed = 12345;
+    ctx.functions.push_back(make_fn("wm_fn", prog, 0x1000));
+    // 无 crypt=false 豁免 → 无载体 → 全块未嵌 → fail-closed。
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = carrier_rules(false);
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = junk_plan();
+
+    wvmp::passes::MutatePass pass;
+    EXPECT_THROW(pass.run(ctx), std::runtime_error);
+    EXPECT_TRUE(ctx.diag.has_errors());
+}
+
+TEST(MutateWatermark, RngOrderUnchangedWithSlot) {
+    // 同 seed：水印开/关，junk Mov 的位置与数量完全一致（rng 消费序不变
+    // 的单元级实证）；仅被携带的 imm 值不同。
+    const auto prog = chain_program(20);
+    wvmp::ProtectionContext off, on;
+    for (wvmp::ProtectionContext* c : {&off, &on}) {
+        c->seed = 777;
+        c->functions.push_back(make_fn("wm_fn", prog, 0x1000));
+        c->slot<wvmp::ProtectRules>(wvmp::kProtectRules) = carrier_rules(true);
+    }
+    on.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = junk_plan();
+    wvmp::passes::MutatePass pass;
+    off.functions[0] = make_fn("wm_fn", prog, 0x1000);
+    on.functions[0] = make_fn("wm_fn", prog, 0x1000);
+    pass.run(off);
+    pass.run(on);
+
+    std::vector<std::pair<size_t, Reg>> junk_off, junk_on;
+    auto collect = [](const wvmp::ProtectionContext& c,
+                      std::vector<std::pair<size_t, Reg>>* out) {
+        size_t pos = 0;
+        for (const auto& b : c.functions[0].blocks)
+            for (const auto& i : b.insns) {
+                if (i.op == wvmp::ir::Op::Mov &&
+                    i.src.kind == wvmp::ir::Operand::Kind::Imm &&
+                    i.dst.kind == wvmp::ir::Operand::Kind::Reg)
+                    out->push_back({pos, i.dst.reg});
+                ++pos;
+            }
+    };
+    collect(off, &junk_off);
+    collect(on, &junk_on);
+    EXPECT_EQ(junk_off.size(), junk_on.size());
+    for (size_t i = 0; i < junk_off.size() && i < junk_on.size(); ++i)
+        EXPECT_EQ(junk_off[i], junk_on[i]) << "junk 位置/寄存器漂移 @ " << i;
+}
+
+TEST(MutateWatermark, WindowCollidingChunkFailsClosed) {
+    // 撞映像窗口的固定块值 = 永不可携带（translate_mov 会把窗口内 imm 折
+    // 条成 Mov(RVA)+LeaRva，chunk 字节不进词流 aux）。image_base=0x1000、
+    // extent 缺省 2^32 → 窗口 [0x1000, 0x100001000)。值 "0000105011223344"：
+    // 块 0 = 0x00001050 恒撞窗 → 零份 → fail-closed 抛错（拒绝产出不可见
+    // 水印）。通配版（"0000??50…"）由 rng 填充多数槽在窗外、顺延可嵌，
+    // 其语义由 RngOrderUnchanged + E2E 覆盖。
+    wvmp::ProtectionContext ctx;
+    ctx.seed = 12345;
+    ctx.functions.push_back(make_fn("wm_fn", chain_program(20), 0x1000));
+    ctx.slot<wvmp::ProtectRules>(wvmp::kProtectRules) = carrier_rules(true);
+    wvmp::wm::WatermarkPlan plan = junk_plan();
+    plan.watermark.value = "0000105011223344";
+    plan.watermark.compile();
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+    wvmp::passes::PeImage img;
+    img.image_base = 0x1000;
+    ctx.slot<wvmp::passes::PeImage>(wvmp::passes::kImageMeta) = img;
+
+    wvmp::passes::MutatePass pass;
+    EXPECT_THROW(pass.run(ctx), std::runtime_error);
+    EXPECT_TRUE(ctx.diag.has_errors());
 }

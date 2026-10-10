@@ -14,6 +14,7 @@
 #include "wvmp/passes/tls_hook/tls_plan.hpp"
 #include "wvmp/wm/watermark.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <optional>
@@ -97,9 +98,12 @@ void PeWriterPass::run(ProtectionContext& ctx) {
     if (ctx.image.empty()) fail(ctx, "镜像为空，没有可写出的内容");
     if (ctx.output_path.empty()) fail(ctx, "输出路径为空");
 
-    // MIT-541 fail-closed：配置了水印但没有新节可承载 → 显式失败。静默
-    // 丢水印 = 溯源断链，比失败更糟（下游以为副本可追溯）。
-    if (ctx.has_slot(kWatermark)) {
+    // MIT-541 fail-closed：padding 面配置了水印但没有新节可承载 → 显式
+    // 失败。静默丢水印 = 溯源断链，比失败更糟（下游以为副本可追溯）。
+    // M2 起 mode=junk 不依赖新节（载体在 VM 词流），不在此 gate 内。
+    if (const auto* wm_early = ctx.find_slot<wm::WatermarkPlan>(kWatermark);
+        wm_early != nullptr &&
+        wm_early->mode != wm::WatermarkMode::Junk) {
         const auto* wm_secs =
             ctx.find_slot<std::vector<NewSection>>(kNewSections);
         if (wm_secs == nullptr || wm_secs->empty())
@@ -409,19 +413,39 @@ void PeWriterPass::run(ProtectionContext& ctx) {
             fail(ctx, std::string("追加新节失败: ") + e.what());
         }
 
-        // 1.5) MIT-541 水印嵌入：新节尾垫（SizeOfRawData 对齐产生的零
-        // 填充区，VirtualSize 之外、无功能字节）内分散嵌入 copies 份。
-        // 槽缺席 = 不嵌入（缺省零扰动契约）。通配 nibble 从 ctx.rng
-        // 现场填充——同 seed 可复现，不同副本物理字节互异而 dump/mask
-        // 身份不变。位于 checksum 重算之前，水印字节被校验和覆盖。
-        // fail() 抛出的错误不得被上面的 add_sections catch 吞改写，故
-        // 整段在 try 外。
-        if (auto* plan = ctx.find_slot<wm::WatermarkPlan>(kWatermark)) {
+        // 1.5) MIT-541 水印嵌入（M2 起碎片分散）：新节尾垫（SizeOfRawData
+        // 对齐产生的零填充区，VirtualSize 之外、无功能字节）内分散嵌入
+        // copies 份 × fragments 片。槽缺席或 mode=junk = 不进本分支（缺省
+        // 零扰动契约；junk 模式载体在 VM 词流，由 mutate pass 发射）。
+        // 通配 nibble 从 ctx.rng 现场填充——同 seed 可复现，不同副本物理
+        // 字节互异而 dump/mask 身份不变。位于 checksum 重算之前，水印
+        // 字节被校验和覆盖。fail() 抛出的错误不得被上面的 add_sections
+        // catch 吞改写，故整段在 try 外。
+        if (auto* plan = ctx.find_slot<wm::WatermarkPlan>(kWatermark);
+            plan != nullptr && plan->mode != wm::WatermarkMode::Junk) {
             const size_t pattern_len = plan->watermark.dump.size();
             if (pattern_len == 0)
                 fail(ctx, "水印计划 dump 为空（compile 未执行？）");
+            // M2 碎片：fragments > 1 时切块分散（每片 ≥4B 且固定位达下限
+            //——config 已校验，此处空 = 契约兜底 fail）。片数 1 = v1 整段。
+            const std::vector<wm::Fragment> frags =
+                plan->fragments > 1
+                    ? wm::split_fragments(plan->watermark, plan->fragments, 4)
+                    : std::vector<wm::Fragment>{};
+            const bool fragmented = plan->fragments > 1;
+            if (fragmented && frags.empty())
+                fail(ctx, "水印碎片切分失败（config 层 check_layout 已过，"
+                          "此处为契约兜底）");
+            const size_t unit_count = fragmented ? frags.size() : 1;
 
-            // 尾垫区间池：每节 [data 末端, raw 末端)。
+            // 尾垫区间池：每节 [data 末端, raw 末端)。碎片模式下按最大
+            // 单片长度过滤 span（单片 4 字节即可入池，比整段宽）。
+            const size_t max_unit = fragmented
+                ? std::max_element(frags.begin(), frags.end(),
+                                   [](const wm::Fragment& a, const wm::Fragment& b) {
+                                       return a.dump.size() < b.dump.size();
+                                   })->dump.size()
+                : pattern_len;
             struct Span { size_t off, len; };
             std::vector<Span> spans;
             for (size_t i = 0; i < placed.size(); ++i) {
@@ -429,12 +453,12 @@ void PeWriterPass::run(ProtectionContext& ctx) {
                                  new_sections->at(i).data.size();
                 const size_t e = size_t(placed[i].file_offset) +
                                  placed[i].raw_size;
-                if (e > b && e - b >= pattern_len)
+                if (e > b && e - b >= max_unit)
                     spans.push_back({b, e - b});
             }
             // 预算不足 → 最后一个新节 raw 增一档 file_align（raw >
-            // virtual 合法，多出的文件字节不映射进内存；≤8 份 × ≤32
-            // 字节 = ≤256 字节，一档 0x200 恒够，仍不足则 fail）。
+            // virtual 合法，多出的文件字节不映射进内存；copies × 整段
+            // ≤ 8×32 = 256 字节，一档 0x200 恒够，仍不足则 fail）。
             size_t pool = 0;
             for (const auto& s : spans) pool += s.len;
             if (pool < size_t(plan->copies) * pattern_len) {
@@ -462,7 +486,7 @@ void PeWriterPass::run(ProtectionContext& ctx) {
                 const size_t b = size_t(placed[last].file_offset) +
                                  new_sections->at(last).data.size();
                 const size_t e = size_t(placed[last].file_offset) + new_raw;
-                if (e > b && e - b >= pattern_len)
+                if (e > b && e - b >= max_unit)
                     spans.push_back({b, e - b});
                 pool = 0;
                 for (const auto& s : spans) pool += s.len;
@@ -473,27 +497,36 @@ void PeWriterPass::run(ProtectionContext& ctx) {
                                   "）；拒绝产出未嵌全的水印副本");
             }
 
-            // copies 份轮转分配到各 span；同 span 内按份数均分槽位
+            // 放置单元 = copies 份 × unit_count 片（碎片模式按 片×份 展
+            // 平轮转），轮转分配到各 span；同 span 内按单元数均分槽位
             // （槽位互不重叠由构造保证；槽内起点 rng 取）。
+            const size_t units = size_t(plan->copies) * unit_count;
             const size_t per_span_max =
-                (size_t(plan->copies) + spans.size() - 1) / spans.size();
+                (units + spans.size() - 1) / spans.size();
             for (const auto& s : spans)
-                if (s.len / per_span_max < pattern_len)
+                if (s.len / per_span_max < max_unit)
                     fail(ctx, "水印嵌入预算不足（span " + std::to_string(s.off) +
                                   " 槽位 " + std::to_string(s.len / per_span_max) +
-                                  " < 模式 " + std::to_string(pattern_len) + "）");
+                                  " < 最大单元 " + std::to_string(max_unit) + "）");
             std::string where;
-            for (size_t k = 0; k < size_t(plan->copies); ++k) {
-                const size_t si = k % spans.size();
-                const size_t idx = k / spans.size();
+            for (size_t u = 0; u < units; ++u) {
+                const size_t piece = u % unit_count;    // 片序（u/unit_count 为份序）
+                const u8* ud = fragmented ? frags[piece].dump.data()
+                                          : plan->watermark.dump.data();
+                const u8* um = fragmented ? frags[piece].mask.data()
+                                          : plan->watermark.mask.data();
+                const size_t ulen =
+                    fragmented ? frags[piece].dump.size() : pattern_len;
+                const size_t si = u % spans.size();
+                const size_t idx = u / spans.size();
                 const size_t slot_len = spans[si].len / per_span_max;
                 const size_t slot_begin = spans[si].off + idx * slot_len;
                 const size_t start = size_t(ctx.rng.uniform(
-                    u64(slot_begin), u64(slot_begin + slot_len - pattern_len)));
+                    u64(slot_begin), u64(slot_begin + slot_len - ulen)));
                 // 填充版模式：固定位按 dump，通配 nibble 取 rng。
-                for (size_t i = 0; i < pattern_len; ++i) {
-                    u8 byte = plan->watermark.dump[i];
-                    const u8 m = plan->watermark.mask[i];
+                for (size_t i = 0; i < ulen; ++i) {
+                    u8 byte = ud[i];
+                    const u8 m = um[i];
                     if ((m & 0xF0) == 0)
                         byte = u8((byte & 0x0F) | (u8(ctx.rng.next() & 0xF) << 4));
                     if ((m & 0x0F) == 0)
@@ -507,8 +540,10 @@ void PeWriterPass::run(ProtectionContext& ctx) {
                 where += "file_off 0x" + std::string(ob);
             }
             ctx.diag.report(Severity::Note, name(),
-                            "水印已嵌入 " + std::to_string(plan->copies) +
-                                " 份（id=" + plan->watermark.id + "，模式 " +
+                            "水印已嵌入 padding 面 " +
+                                std::to_string(plan->copies) + " 份 × " +
+                                std::to_string(unit_count) + " 片（id=" +
+                                plan->watermark.id + "，整段 " +
                                 std::to_string(pattern_len) + " 字节）@ " + where);
         }
         // 节表变化后 NT 头偏移不变（只动表项与文件尾），但保险起见重取模型

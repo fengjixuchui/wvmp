@@ -254,3 +254,121 @@ TEST(Sha256, LongVector) {
     EXPECT_EQ(wvmp::sha256_hex(reinterpret_cast<const u8*>(a.data()), 1000),
               "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3");
 }
+
+// —— M2：碎片切分 ——
+TEST(SplitFragments, SingleFragmentIsWhole) {
+    const auto wm = make_wm("A", "4D5A9011223344FF");
+    const auto frags = wvmp::wm::split_fragments(wm, 1, 4);
+    ASSERT_EQ(frags.size(), 1u);
+    EXPECT_EQ(frags[0].dump.size(), wm.dump.size());
+    EXPECT_EQ(frags[0].src_off, 0u);
+}
+
+TEST(SplitFragments, EvenSplitByteAligned) {
+    // 8 字节切 2 片 → 4+4，src_off 0/4。
+    const auto wm = make_wm("A", "4D5A9011223344FF");
+    const auto frags = wvmp::wm::split_fragments(wm, 2, 4);
+    ASSERT_EQ(frags.size(), 2u);
+    EXPECT_EQ(frags[0].dump.size(), 4u);
+    EXPECT_EQ(frags[1].dump.size(), 4u);
+    EXPECT_EQ(frags[0].src_off, 0u);
+    EXPECT_EQ(frags[1].src_off, 4u);
+    EXPECT_EQ(frags[0].dump[0], 0x4D);
+    EXPECT_EQ(frags[1].dump[0], 0x22);
+}
+
+TEST(SplitFragments, UnevenSplitFrontHeavy) {
+    // 12 字节切 3 片 → 4+4+4（10B 切 3 会出 3 字节片，固定位 6 < 8
+    // 下限必拒——片级下限的真实约束面，见 RejectsFragmentBelowFixedFloor）。
+    const auto wm = make_wm("A", "4D5A9011223344FFAABBCCDD");
+    const auto frags = wvmp::wm::split_fragments(wm, 3, 3);
+    ASSERT_EQ(frags.size(), 3u);
+    EXPECT_EQ(frags[0].dump.size(), 4u);
+    EXPECT_EQ(frags[1].dump.size(), 4u);
+    EXPECT_EQ(frags[2].dump.size(), 4u);
+}
+
+TEST(SplitFragments, RejectsFragmentBelowFixedFloor) {
+    // "4D5A90??03001122"：片 0 含通配整字节，仍 12 nibble 固定（过）；
+    // 构造 "4D5A????90??1122"（8 固定 hex 整段 < 12 过不了 validate，
+    // 改测片级下限：切 2 后每片固定位 4/4 hex < 8 → 拒绝。
+    wvmp::wm::Watermark wm;
+    wm.id = "A";
+    wm.value = "4D5A9011??223344";  // 每片 4 字节各 6/6 固定 nibble < 8
+    wm.compile();
+    const auto frags = wvmp::wm::split_fragments(wm, 2, 4);
+    EXPECT_TRUE(frags.empty());
+}
+
+TEST(SplitFragments, RejectsTooManyFragments) {
+    const auto wm = make_wm("A", "4D5A9011223344FF");  // 8 字节
+    EXPECT_TRUE(wvmp::wm::split_fragments(wm, 4, 4).empty());  // 8/4=2 片上限
+}
+
+// —— M2：碎片扫描 + 多数票 ——
+TEST(ScanFragments, MajorityVoteTwoOfThree) {
+    const auto wm = make_wm("A", "4D5A9011223344FF");
+    const auto frags = wvmp::wm::split_fragments(wm, 2, 4);
+    ASSERT_EQ(frags.size(), 2u);
+    // 只放片 0（4D5A9011）两份：命中片数=1 < 2 → 不定 ID。
+    std::vector<wvmp::u8> data{0x4D, 0x5A, 0x90, 0x11, 0x00,
+                               0x4D, 0x5A, 0x90, 0x11};
+    auto r = wvmp::wm::scan_fragments(frags, data.data(), data.size());
+    EXPECT_EQ(r.count, 2u);
+    EXPECT_EQ(r.fragments_hit, 1u);
+    EXPECT_FALSE(r.identified);
+
+    // 两片各一份 → 多数票过。
+    data.insert(data.end(), {0x22, 0x33, 0x44, 0xFF});
+    r = wvmp::wm::scan_fragments(frags, data.data(), data.size());
+    EXPECT_EQ(r.fragments_hit, 2u);
+    EXPECT_TRUE(r.identified);
+}
+
+TEST(ScanFragments, ThreeFragmentsTwoHitIdentifies) {
+    const auto wm = make_wm("A", "4D5A9011223344FFAABBCCDD");  // 12B → 4+4+4
+    const auto frags = wvmp::wm::split_fragments(wm, 3, 3);
+    ASSERT_EQ(frags.size(), 3u);
+    std::vector<wvmp::u8> data{0x4D, 0x5A, 0x90, 0x11,        // 片 0
+                               0x22, 0x33, 0x44, 0xFF};       // 片 1
+    const auto r = wvmp::wm::scan_fragments(frags, data.data(), data.size());
+    EXPECT_EQ(r.fragments_hit, 2u);
+    EXPECT_TRUE(r.identified);  // ceil(3/2)=2
+}
+
+TEST(ScanFragments, SingleFragmentKeepsV1Semantics) {
+    const auto wm = make_wm("A", "4D5A9011223344FF");
+    const auto frags = wvmp::wm::split_fragments(wm, 1, 4);
+    std::vector<wvmp::u8> data{0x4D, 0x5A, 0x90, 0x11, 0x22, 0x33, 0x44, 0xFF};
+    const auto r = wvmp::wm::scan_fragments(frags, data.data(), data.size());
+    EXPECT_TRUE(r.identified);
+    EXPECT_EQ(r.count, 1u);
+}
+
+// —— M2：AreSimilar 防碰撞（VMProtect 移植语义）——
+TEST(AreSimilar, ExactAndCaseInsensitive) {
+    EXPECT_TRUE(wvmp::wm::are_similar("4D5A9011223344FF", "4D5A9011223344FF"));
+    EXPECT_TRUE(wvmp::wm::are_similar("4d5a9011223344ff", "4D5A9011223344FF"));
+    EXPECT_FALSE(wvmp::wm::are_similar("4D5A9011223344FF", "9F8E7D6C5B4A1122"));
+}
+
+TEST(AreSimilar, SubstringContainment) {
+    EXPECT_TRUE(wvmp::wm::are_similar("4D5A9011223344FF", "4D5A9011"));
+    EXPECT_TRUE(wvmp::wm::are_similar("223344FF", "4D5A9011223344FF"));
+    EXPECT_FALSE(wvmp::wm::are_similar("4D5A9011", "223344FF"));
+}
+
+TEST(AreSimilar, WildcardOverlap) {
+    // 长 16 与长 15 在任意窗口上都不同长度 → 不包含；此用例钉 "?" 通配
+    // 语义：等长时 '?' 抹平差异即相似。
+    EXPECT_TRUE(wvmp::wm::are_similar("4D5A90112233?4FF", "4D5A9011223344FF"));
+    // 通配窗口包含：短串带 '?' 在长串某窗口全配 → 相似（误归因面）。
+    EXPECT_TRUE(wvmp::wm::are_similar("4D5A90??", "4D5A9011223344FF"));
+    EXPECT_TRUE(wvmp::wm::are_similar("??223344", "4D5A9011223344FF"));
+    EXPECT_FALSE(wvmp::wm::are_similar("4D5A??33", "4D5A9011223344FF"));
+}
+
+TEST(AreSimilar, EmptyIsSimilar) {
+    EXPECT_TRUE(wvmp::wm::are_similar("", "4D5A9011"));
+    EXPECT_TRUE(wvmp::wm::are_similar("4D5A9011", ""));
+}

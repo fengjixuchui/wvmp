@@ -936,6 +936,19 @@ static wvmp::wm::WatermarkPlan make_wm_plan(u32 copies) {
     return plan;
 }
 
+// M2 碎片用全固定值：带通配的值半片固定位易低于片级下限（≥8 hex）。
+static wvmp::wm::WatermarkPlan make_wm_plan_fixed(u32 copies, u32 fragments,
+                                                  wvmp::wm::WatermarkMode mode) {
+    wvmp::wm::WatermarkPlan plan;
+    plan.watermark.id = "Customer_F";
+    plan.watermark.value = "4D5A9011223344FF";
+    plan.watermark.compile();
+    plan.copies = copies;
+    plan.fragments = fragments;
+    plan.mode = mode;
+    return plan;
+}
+
 TEST(PeWriterPass, WatermarkSlotAbsentKeepsOutputByteExactVsBaseline) {
     // 缺省零扰动契约：同一夹具跑两遍（同 seed，均不带 kWatermark 槽），
     // 逐字节一致；且镜像尺寸 = 落位表期望（0x400 + 0x2200），无任何
@@ -1057,4 +1070,78 @@ TEST(PeWriterPass, WatermarkDeterministicPerSeedSameIdDifferentBytes) {
                                            cC.image.size());
     EXPECT_GE(hit7.count, size_t(plan.copies));
     EXPECT_GE(hit8.count, size_t(plan.copies));
+}
+
+// —— MIT-541 M2：碎片分散 + junk 模式跳过 ————————————————————————
+
+TEST(PeWriterPass, WatermarkFragmentsScatteredAndIdentifiable) {
+    // fragments=2：8 字节 → 4+4 两片 × copies=3 = 6 个放置单元，全部落
+    // 在 .wvmp 尾垫内；scan_fragments 多数票（两片全中）过。
+    const fs::path out = temp_dir() / "wm_frag.exe";
+    ProtectionContext ctx;
+    make_wm_fixture(ctx, 0x2100, out);
+    ctx.rng.reseed(7);
+    const wvmp::wm::WatermarkPlan plan =
+        make_wm_plan_fixed(3, 2, wvmp::wm::WatermarkMode::Padding);
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+
+    const auto frags = wvmp::wm::split_fragments(plan.watermark, 2, 4);
+    ASSERT_EQ(frags.size(), 2u);
+    const auto r = wvmp::wm::scan_fragments(frags, ctx.image.data(),
+                                            ctx.image.size());
+    EXPECT_TRUE(r.identified);
+    EXPECT_EQ(r.fragments_hit, 2u);
+    // 3 份 × 2 片 = 6 次命中。
+    EXPECT_EQ(r.count, 6u);
+    // 差异仍限于尾垫 + checksum（碎片不改区间断言的边界）。
+    const fs::path base = temp_dir() / "wm_frag_base.exe";
+    ProtectionContext base_ctx;
+    make_wm_fixture(base_ctx, 0x2100, base);
+    base_ctx.rng.reseed(7);
+    writer.run(base_ctx);
+    ASSERT_EQ(base_ctx.image.size(), ctx.image.size());
+    for (size_t i = 0; i < base_ctx.image.size(); ++i)
+        if (base_ctx.image[i] != ctx.image[i]) {
+            const bool in_checksum = i >= kChkOff && i < kChkOff + 4;
+            const bool in_padding =
+                i >= size_t(0x400 + 0x2100) && i < size_t(0x400 + 0x2200);
+            ASSERT_TRUE(in_checksum || in_padding)
+                << "碎片差异越界 @0x" << std::hex << i;
+        }
+}
+
+TEST(PeWriterPass, WatermarkJunkModeSkipsPaddingEmbed) {
+    // mode=junk：padding 面整段不动（byte-exact vs 无槽基线）——载体在
+    // VM 词流（mutate 面），pe_writer 只放行。
+    const fs::path base = temp_dir() / "wm_junk_base.exe";
+    const fs::path out = temp_dir() / "wm_junk_out.exe";
+    ProtectionContext base_ctx, wm_ctx;
+    make_wm_fixture(base_ctx, 0x2100, base);
+    make_wm_fixture(wm_ctx, 0x2100, out);
+    base_ctx.rng.reseed(7);
+    wm_ctx.rng.reseed(7);
+    wvmp::passes::PeWriterPass writer;
+    writer.run(base_ctx);
+    wvmp::wm::WatermarkPlan plan = make_wm_plan(3);
+    plan.mode = wvmp::wm::WatermarkMode::Junk;
+    wm_ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+    writer.run(wm_ctx);
+    EXPECT_EQ(0, std::memcmp(base_ctx.image.data(), wm_ctx.image.data(),
+                             base_ctx.image.size()));
+}
+
+TEST(PeWriterPass, WatermarkJunkModeWithoutSectionsSucceeds) {
+    // mode=junk + 无新节：不触发"有槽无节"fail-closed（junk 不依赖新节；
+    // 载体有无由 mutate 的 fail-closed 把守）。镜像正常写出。
+    ProtectionContext ctx;
+    ctx.image = build_minimal_pe(true, kMachineX64);
+    ctx.output_path = temp_dir() / "wm_junk_nosec.exe";
+    wvmp::wm::WatermarkPlan plan = make_wm_plan(3);
+    plan.mode = wvmp::wm::WatermarkMode::Junk;
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+    wvmp::passes::PeWriterPass writer;
+    writer.run(ctx);
+    EXPECT_TRUE(fs::exists(ctx.output_path));
 }

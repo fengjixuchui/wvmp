@@ -4,9 +4,13 @@
 #include "wvmp/framework/keys.hpp"
 #include "wvmp/framework/protect_levels.hpp"
 #include "wvmp/framework/registry.hpp"
+#include "wvmp/passes/pe_loader/pe_image.hpp"
+#include "wvmp/wm/watermark.hpp"
 
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -216,6 +220,75 @@ void MutatePass::run(ProtectionContext& ctx) {
     std::string site_log;
     bool region_allowed = true;  // MIT-482：诊断白名单（发射级丢弃）。
 
+    // —— MIT-541 M2：junk-Mov 水印载体（mode=junk/both）——
+    // 载体 = crypt 豁免函数（[[functions]] crypt=false）里发射的 junk-Mov
+    // imm32：imm 在 VM 词 [op|..|aux32] 的高 4 字节 LE 连续（isa
+    // encoding kAuxShift=32），豁免函数 blob 明文落盘 → 文件级可扫。
+    // 纪律：只改写 imm 值、不动 rng 抽取序——同 seed 下水印开/关，junk
+    // 位置与其余 imm 逐比特一致（产物差异面最小化）。
+    const wm::WatermarkPlan* wm_plan = ctx.find_slot<wm::WatermarkPlan>(kWatermark);
+    const bool wm_junk_active =
+        wm_plan != nullptr && (wm_plan->mode == wm::WatermarkMode::Junk ||
+                               wm_plan->mode == wm::WatermarkMode::Both);
+    std::vector<wm::Fragment> wm_chunks;
+    std::vector<u32> wm_placed;      // 每块已嵌份数
+    std::string wm_carriers;         // 载体函数名单（Note 披露）
+    // 映像窗口镜像（与 translator translate_mov / regvm_backend 布线同口
+    // 径）：窗口内立即数会被折条成 Mov(RVA)+LeaRva——chunk 字节不进词流
+    // aux，撞窗的槽不携带（换下一个 junk 槽），保证已嵌块必然原样可见。
+    u64 wm_img_base = 0, wm_img_extent = 0;
+    if (wm_junk_active) {
+        wm_chunks = wm::split_fragments(
+            wm_plan->watermark, wm_plan->watermark.dump.size() / 4, 4);
+        if (wm_chunks.empty()) {
+            ctx.diag.report(Severity::Error, name(),
+                            "junk 水印块切分失败（config 层 check_layout 已过，"
+                            "此处为契约兜底）");
+            throw std::runtime_error(std::string(name()) +
+                                     ": junk 水印块切分失败");
+        }
+        wm_placed.assign(wm_chunks.size(), 0);
+        if (const PeImage* pe = ctx.find_slot<PeImage>(kImageMeta)) {
+            wm_img_base = pe->image_base;
+            if (ctx.image.size() >= 0x40) {
+                const size_t e_off = static_cast<size_t>(ctx.image[0x3C]) |
+                                     (static_cast<size_t>(ctx.image[0x3D]) << 8);
+                const size_t opt_h = e_off + 24;
+                if (opt_h + 64 <= ctx.image.size())
+                    wm_img_extent = static_cast<u64>(ctx.image[opt_h + 56]) |
+                                    (static_cast<u64>(ctx.image[opt_h + 57]) << 8) |
+                                    (static_cast<u64>(ctx.image[opt_h + 58]) << 16) |
+                                    (static_cast<u64>(ctx.image[opt_h + 59]) << 24);
+            }
+        }
+    }
+    const auto wm_in_image_window = [&](u32 v) {
+        if (wm_img_base == 0) return false;
+        const u64 extent = wm_img_extent != 0 ? wm_img_extent : 0xFFFF'FFFFull;
+        const u64 uv = v;  // imm 恒 >= 0（u32 零扩），窗口判定同 translate_mov
+        return uv >= wm_img_base && uv - wm_img_base < extent;
+    };
+    // 块值物化：固定位按 dump，通配 nibble 从本槽已抽的 junk_imm 取位
+    //（零额外 rng 消费；≤4 字节通配 ≤8 nibble 恒够）。
+    const auto wm_materialize = [](const wm::Fragment& f, u32 fill) {
+        u32 v = 0;
+        size_t nib = 0;
+        for (int b = 0; b < 4; ++b) {
+            const u8 m = f.mask[static_cast<size_t>(b)];
+            u8 byte = f.dump[static_cast<size_t>(b)];
+            if ((m & 0xF0) == 0)
+                byte = static_cast<u8>(
+                    (byte & 0x0F) |
+                    (static_cast<u8>((fill >> (4 * nib++)) & 0xF) << 4));
+            if ((m & 0x0F) == 0)
+                byte = static_cast<u8>(
+                    (byte & 0xF0) |
+                    static_cast<u8>((fill >> (4 * nib++)) & 0xF));
+            v |= static_cast<u32>(byte) << (8 * b);
+        }
+        return v;
+    };
+
     for (size_t fn_index = 0; fn_index < ctx.functions.size(); ++fn_index) {
         ir::FunctionRegion& fn = ctx.functions[fn_index];
         if (fn.blocks.empty()) continue;
@@ -242,6 +315,15 @@ void MutatePass::run(ProtectionContext& ctx) {
         if (rules != nullptr &&
             rules->level_for(fn.begin_rva, fn_index, fn.name) == ProtectLevel::None)
             continue;
+
+        // MIT-541 M2：本函数是否 junk 水印载体（crypt 豁免；与 crypt pass
+        // 的 resolve_crypt 同口径——fn_index 即 ctx.functions 扫描序）。
+        const bool wm_is_carrier =
+            wm_junk_active && rules != nullptr && [&] {
+                const auto d = rules->resolve_crypt(fn.begin_rva, fn_index, fn.name);
+                return d.crypt.has_value() && !*d.crypt;
+            }();
+        bool wm_fn_carried = false;  // 载体名单去重（每函数记一次）
 
         const ir::Size junk_size =
             fn.arch == ir::Arch::X64 ? ir::Size::S64 : ir::Size::S32;
@@ -389,17 +471,52 @@ void MutatePass::run(ProtectionContext& ctx) {
                         // 字节对账时需知悉（MIT-485 验收建议 2）。
                         ++junk_movs;
                         if (region_allowed) {
+                            u32 imm = junk_imm;
+                            // MIT-541 M2：载体函数的水印块改写。选块策略：
+                            // 先保证每块至少 1 份（块序），再按"份数最少者
+                            // 优先"轮转补至 copies。撞映像窗口（折条面）的
+                            // 槽不携带，顺延到下一个 junk 槽。
+                            bool carried = false;
+                            if (wm_is_carrier && !wm_chunks.empty()) {
+                                size_t ci = wm_chunks.size();
+                                for (size_t q = 0; q < wm_chunks.size(); ++q)
+                                    if (wm_placed[q] == 0) { ci = q; break; }
+                                if (ci == wm_chunks.size()) {
+                                    const u32 cap = wm_plan->copies;
+                                    for (size_t q = 0; q < wm_chunks.size(); ++q)
+                                        if (wm_placed[q] < cap &&
+                                            (ci == wm_chunks.size() ||
+                                             wm_placed[q] < wm_placed[ci]))
+                                            ci = q;
+                                }
+                                if (ci != wm_chunks.size()) {
+                                    const u32 cand =
+                                        wm_materialize(wm_chunks[ci], junk_imm);
+                                    if (!wm_in_image_window(cand)) {
+                                        imm = cand;
+                                        ++wm_placed[ci];
+                                        carried = true;
+                                        if (!wm_fn_carried) {
+                                            wm_fn_carried = true;
+                                            if (!wm_carriers.empty())
+                                                wm_carriers += ", ";
+                                            wm_carriers += fn.name;
+                                        }
+                                    }
+                                }
+                            }
                             ir::Insn junk;
                             junk.op = ir::Op::Mov;
                             junk.size = junk_size;
                             junk.dst = ir::Operand::reg_(dead[i][pick]);
-                            junk.src = ir::Operand::imm_(static_cast<i64>(junk_imm));
+                            junk.src = ir::Operand::imm_(static_cast<i64>(imm));
                             junk.addr = host;
                             mutated.push_back(junk);
                             inserted = true;
                             site_log += site_note(fn, blk_i, i, host,
                                                   static_cast<int>(dead[i][pick]), true,
-                                                  junk_imm);
+                                                  imm);
+                            if (carried) (void)0;
                         }
                     }
                 }
@@ -421,6 +538,36 @@ void MutatePass::run(ProtectionContext& ctx) {
         ctx.diag.report(Severity::Note, name(), "注入点清单: " + site_log);
     } else
         ctx.diag.report(Severity::Note, name(), "本次未注入垃圾指令（密度抽样为空）");
+
+    // MIT-541 M2 fail-closed：junk 水印有块未嵌入（零份）= 溯源断链。
+    // 零份的成因：无 crypt 豁免函数被 mutate 处理 / 豁免函数无 junk 发射
+    //（junk_density=0、无死寄存器边界、间接跳转/串微程序 gate、映像窗口
+    // 撞片顺延耗尽）。份数 < copies 但 >= 1 属"尽力冗余"披露不失败。
+    if (wm_junk_active) {
+        size_t unplaced = 0;
+        std::string dist;
+        for (size_t q = 0; q < wm_placed.size(); ++q) {
+            if (wm_placed[q] == 0) ++unplaced;
+            if (!dist.empty()) dist += "/";
+            dist += std::to_string(wm_placed[q]);
+        }
+        if (unplaced > 0) {
+            const std::string msg =
+                "junk 水印有 " + std::to_string(unplaced) + "/" +
+                std::to_string(wm_placed.size()) +
+                " 块未嵌入（载体函数: " +
+                (wm_carriers.empty() ? "无" : wm_carriers) +
+                "）——检查 [[functions]] crypt=false 豁免函数是否被虚拟化、"
+                "[mutate] junk_density 是否为 0；拒绝产出不可溯源副本";
+            ctx.diag.report(Severity::Error, name(), msg);
+            throw std::runtime_error(std::string(name()) + ": " + msg);
+        }
+        ctx.diag.report(Severity::Note, name(),
+                        "junk 水印已嵌入 " + std::to_string(wm_placed.size()) +
+                            " 块（每块份数 " + dist + "，上限 copies=" +
+                            std::to_string(wm_plan->copies) +
+                            "；载体: " + wm_carriers + "）");
+    }
 }
 
 WVMP_REGISTER_PASS(MutatePass)

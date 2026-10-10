@@ -202,6 +202,12 @@ int cmd_protect(const wvmp::cli::ArgsResult& args) {
                                        : wm_value.substr(0, 8);
             wm_plan.watermark.value = wm_value;
             wm_plan.copies = config.has_watermark ? config.watermark.copies : 3;
+            // M2：mode/fragments 只来自配置（--watermark 只覆盖值；值相关的
+            // 布局校验在 compile 后重跑——覆盖可能破坏 junk 的 4 字节块对齐）。
+            if (config.has_watermark) {
+                wm_plan.mode = config.watermark.mode;
+                wm_plan.fragments = config.watermark.fragments;
+            }
             std::string why;
             if (!wvmp::wm::validate(wm_plan.watermark.id, wm_value, &why)) {
                 std::fprintf(stderr, "[wvmp] 水印配置无效: %s\n", why.c_str());
@@ -211,6 +217,11 @@ int cmd_protect(const wvmp::cli::ArgsResult& args) {
                 wm_plan.watermark.compile();
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[wvmp] 水印编译失败: %s\n", e.what());
+                return 1;
+            }
+            if (!wvmp::wm::check_layout(wm_plan.watermark, wm_plan.mode,
+                                        wm_plan.fragments, &why)) {
+                std::fprintf(stderr, "[wvmp] 水印布局无效: %s\n", why.c_str());
                 return 1;
             }
         }
@@ -262,8 +273,15 @@ int cmd_protect(const wvmp::cli::ArgsResult& args) {
                 if (c != '?') ++n;
             return n;
         }();
-        std::printf("[wvmp] 水印 : id=%s 固定位=%zub copies=%u%s\n",
-                    wm_plan.watermark.id.c_str(), fixed, wm_plan.copies,
+        const char* mode_name = wm_plan.mode == wvmp::wm::WatermarkMode::Junk
+                                    ? "junk"
+                                    : (wm_plan.mode == wvmp::wm::WatermarkMode::Both
+                                           ? "both" : "padding");
+        std::printf("[wvmp] 水印 : id=%s 固定位=%zub copies=%u mode=%s%s%s\n",
+                    wm_plan.watermark.id.c_str(), fixed, wm_plan.copies, mode_name,
+                    wm_plan.fragments > 1
+                        ? (" fragments=" + std::to_string(wm_plan.fragments)).c_str()
+                        : "",
                     args.watermark_override.empty() ? "" : "（--watermark 覆盖）");
     }
     std::printf("[wvmp] %s\n", describe_pipeline(pipeline).c_str());

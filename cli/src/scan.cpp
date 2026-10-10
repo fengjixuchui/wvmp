@@ -3,46 +3,75 @@
 #include <array>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
+#include <utility>
 #include <vector>
 
 namespace wvmp::cli {
+namespace {
+
+// 与嵌入端同一切分规则（pe_writer padding 面 / mutate junk 面）：
+//   padding/both + fragments>1 → N 等分（split_fragments 语义）；
+//   junk/both → dump.size()/4 个 4 字节块；
+//   padding + fragments=1 → 整段单片。
+// both = 两案并试（任一案多数票过即命中）。
+std::vector<std::vector<wm::Fragment>> schemes_of(const ScanItem& item) {
+    std::vector<std::vector<wm::Fragment>> out;
+    const auto& w = item.watermark;
+    if (item.mode != wm::WatermarkMode::Junk && item.fragments > 1) {
+        auto frags = wm::split_fragments(w, item.fragments, 4);
+        if (!frags.empty()) out.push_back(std::move(frags));
+    } else if (item.mode != wm::WatermarkMode::Junk) {
+        auto whole = wm::split_fragments(w, 1, 4);
+        if (!whole.empty()) out.push_back(std::move(whole));
+    }
+    if (item.mode != wm::WatermarkMode::Padding && w.dump.size() % 4 == 0) {
+        auto chunks = wm::split_fragments(w, w.dump.size() / 4, 4);
+        if (!chunks.empty()) out.push_back(std::move(chunks));
+    }
+    return out;
+}
+
+} // namespace
 
 ScanReport scan_file(const std::filesystem::path& input,
-                     const std::vector<wm::Watermark>& items) {
+                     const std::vector<ScanItem>& items) {
     ScanReport rep;
     std::ifstream in(input, std::ios::binary);
     if (!in) {
         rep.error = "无法打开待扫描文件: " + input.string();
         return rep;
     }
-    // 每枚水印一个 matcher；64KB 块流式喂入（对齐参考实现的 4096 分块
-    // 思路，块大小只影响 IO 次数不影响语义）。
-    std::vector<wm::StreamMatcher> matchers;
-    matchers.reserve(items.size());
-    for (const auto& wm : items) matchers.emplace_back(wm);
-    std::vector<size_t> counts(items.size(), 0);
-    std::vector<std::vector<size_t>> offsets(items.size());
-    std::array<u8, 65536> buf;
-    size_t base = 0;
-    while (in) {
-        in.read(reinterpret_cast<char*>(buf.data()),
-                static_cast<std::streamsize>(buf.size()));
-        const size_t n = static_cast<size_t>(in.gcount());
-        for (size_t i = 0; i < n; ++i) {
-            for (size_t k = 0; k < items.size(); ++k) {
-                if (matchers[k].feed(buf[i])) {
-                    ++counts[k];
-                    if (offsets[k].size() < wm::kMaxReportOffsets)
-                        offsets[k].push_back(base + i);
+    // 一次性读入（E2E 实测的样本量 MB 级；流式分块对匹配语义无增益，
+    // 文件级缓存一次读尽再跑 K 个 matcher 更简单且可复跑 offsets）。
+    // ifstream 的 char_traits 是 char，逐块 read 后拷贝进 u8 向量。
+    std::vector<u8> data;
+    {
+        char buf[65536];
+        while (in.read(buf, sizeof buf) || in.gcount() > 0)
+            data.insert(data.end(), buf, buf + in.gcount());
+        if (in.bad()) {
+            rep.error = "读取待扫描文件失败: " + input.string();
+            return rep;
+        }
+    }
+    for (const ScanItem& item : items) {
+        size_t best_count = 0;
+        std::vector<size_t> best_offsets;
+        bool identified = false;
+        for (const auto& scheme : schemes_of(item)) {
+            const auto r = wm::scan_fragments(scheme, data.data(), data.size());
+            if (r.identified) {
+                identified = true;
+                if (r.count > best_count) {
+                    best_count = r.count;
+                    best_offsets = r.offsets;
                 }
             }
         }
-        base += n;
-    }
-    for (size_t k = 0; k < items.size(); ++k) {
-        if (counts[k] == 0) continue;
+        if (!identified) continue;
         rep.any_hit = true;
-        rep.hits.push_back({items[k].id, counts[k], std::move(offsets[k])});
+        rep.hits.push_back({item.watermark.id, best_count, std::move(best_offsets)});
     }
     rep.ok = true;
     return rep;

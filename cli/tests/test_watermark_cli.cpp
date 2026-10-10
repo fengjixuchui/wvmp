@@ -95,10 +95,10 @@ TEST(WatermarkConfig, RejectsUnknownSubkey) {
         std::string(kBaseToml) +
         "[watermark]\n"
         "value = \"4D5A9011223344FF\"\n"
-        "fragments = 2\n");  // v2 预留键，v1 拒绝
+        "frag_cnt = 2\n");  // 真未知键（fragments 已在 M2 转正）
     const auto r = wvmp::cli::parse_config(toml.path());
     ASSERT_FALSE(r.ok);
-    EXPECT_TRUE(contains(r.error, "[watermark] 未知子键 'fragments'"));
+    EXPECT_TRUE(contains(r.error, "[watermark] 未知子键 'frag_cnt'"));
 }
 
 TEST(WatermarkConfig, RejectsMissingValue) {
@@ -179,9 +179,10 @@ TEST(WatermarkRegistry, ParsesAndCompiles) {
     const auto r = wvmp::cli::parse_watermark_registry(reg.path());
     ASSERT_TRUE(r.ok) << r.error;
     ASSERT_EQ(r.items.size(), 2u);
-    EXPECT_EQ(r.items[0].id, "Customer_A");
-    EXPECT_EQ(r.items[0].dump.size(), 8u);
-    EXPECT_EQ(r.items[1].id, "Customer_B");
+    EXPECT_EQ(r.items[0].watermark.id, "Customer_A");
+    EXPECT_EQ(r.items[0].watermark.dump.size(), 8u);
+    EXPECT_EQ(r.items[0].mode, wvmp::wm::WatermarkMode::Padding);
+    EXPECT_EQ(r.items[1].watermark.id, "Customer_B");
 }
 
 TEST(WatermarkRegistry, RejectsUnknownField) {
@@ -230,7 +231,8 @@ TEST(ScanFile, HitsEmbeddedWatermark) {
     content += std::string(64, '\xAA');
     const TempFile bin(".bin", content);
 
-    const auto rep = wvmp::cli::scan_file(bin.path(), {wm});
+    const wvmp::cli::ScanItem item{wm, wvmp::wm::WatermarkMode::Padding, 1};
+    const auto rep = wvmp::cli::scan_file(bin.path(), {item});
     ASSERT_TRUE(rep.ok) << rep.error;
     ASSERT_TRUE(rep.any_hit);
     ASSERT_EQ(rep.hits.size(), 1u);
@@ -246,7 +248,8 @@ TEST(ScanFile, NoHitCleanFile) {
     wm.value = "4D5A90??11223344";
     wm.compile();
     const TempFile bin(".bin", std::string(256, '\x00'));
-    const auto rep = wvmp::cli::scan_file(bin.path(), {wm});
+    const wvmp::cli::ScanItem item{wm, wvmp::wm::WatermarkMode::Padding, 1};
+    const auto rep = wvmp::cli::scan_file(bin.path(), {item});
     ASSERT_TRUE(rep.ok) << rep.error;
     EXPECT_FALSE(rep.any_hit);
     EXPECT_TRUE(rep.hits.empty());
@@ -257,8 +260,210 @@ TEST(ScanFile, MissingInputFails) {
     wm.id = "A";
     wm.value = "4D5A9011223344FF";
     wm.compile();
+    const wvmp::cli::ScanItem item{wm, wvmp::wm::WatermarkMode::Padding, 1};
     const auto rep = wvmp::cli::scan_file(
-        std::filesystem::temp_directory_path() / "wvmp_wm_no_such_7a1.bin", {wm});
+        std::filesystem::temp_directory_path() / "wvmp_wm_no_such_7a1.bin", {item});
     ASSERT_FALSE(rep.ok);
     EXPECT_TRUE(contains(rep.error, "无法打开"));
+}
+
+// —— M2：mode/fragments 配置面 ——
+TEST(WatermarkConfigM2, AcceptsJunkModeWithCoherence) {
+    const TempFile toml(".toml",
+        std::string(kBaseToml) +
+        "[[passes]]\nname = \"mutate\"\n"
+        "[[functions]]\nname = \"wvmp_mark_foo\"\ncrypt = false\nlevel = \"virtualize\"\n"
+        "[watermark]\nvalue = \"4D5A9011223344FF\"\nmode = \"junk\"\n");
+    const auto r = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(r.ok) << r.error;
+    ASSERT_TRUE(r.value.has_watermark);
+    EXPECT_EQ(r.value.watermark.mode, wvmp::wm::WatermarkMode::Junk);
+}
+
+TEST(WatermarkConfigM2, JunkModeWithoutCryptExemptionRejected) {
+    const TempFile toml(".toml",
+        std::string(kBaseToml) +
+        "[[passes]]\nname = \"mutate\"\n"
+        "[watermark]\nvalue = \"4D5A9011223344FF\"\nmode = \"junk\"\n");
+    const auto r = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(r.ok);
+    EXPECT_TRUE(contains(r.error, "crypt=false"));
+}
+
+TEST(WatermarkConfigM2, JunkModeWithoutMutatePassRejected) {
+    const TempFile toml(".toml",
+        std::string(kBaseToml) +
+        "[[functions]]\nname = \"wvmp_mark_foo\"\ncrypt = false\n"
+        "[watermark]\nvalue = \"4D5A9011223344FF\"\nmode = \"junk\"\n");
+    const auto r = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(r.ok);
+    EXPECT_TRUE(contains(r.error, "mutate"));
+}
+
+TEST(WatermarkConfigM2, JunkModeNonMultipleOf4BytesRejected) {
+    // 20 hex = 10 字节，10 % 4 != 0。
+    const TempFile toml(".toml",
+        std::string(kBaseToml) +
+        "[[passes]]\nname = \"mutate\"\n"
+        "[[functions]]\nname = \"wvmp_mark_foo\"\ncrypt = false\n"
+        "[watermark]\nvalue = \"4D5A9011223344FFAABB\"\nmode = \"junk\"\n");
+    const auto r = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(r.ok);
+    EXPECT_TRUE(contains(r.error, "4 的倍数"));
+}
+
+TEST(WatermarkConfigM2, JunkModeFragmentsRejected) {
+    const TempFile toml(".toml",
+        std::string(kBaseToml) +
+        "[[passes]]\nname = \"mutate\"\n"
+        "[[functions]]\nname = \"wvmp_mark_foo\"\ncrypt = false\n"
+        "[watermark]\nvalue = \"4D5A9011223344FF\"\nmode = \"junk\"\nfragments = 2\n");
+    const auto r = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(r.ok);
+    EXPECT_TRUE(contains(r.error, "fragments"));
+}
+
+TEST(WatermarkConfigM2, PaddingFragmentsAccepted) {
+    const TempFile toml(".toml",
+        std::string(kBaseToml) +
+        "[watermark]\nvalue = \"4D5A9011223344FF\"\nfragments = 2\n");
+    const auto r = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.value.watermark.fragments, 2u);
+}
+
+TEST(WatermarkConfigM2, PaddingFragmentsTooManyRejected) {
+    // 8 字节 / 4 片 = 每片 2 字节 < 4B 下限。
+    const TempFile toml(".toml",
+        std::string(kBaseToml) +
+        "[watermark]\nvalue = \"4D5A9011223344FF\"\nfragments = 4\n");
+    const auto r = wvmp::cli::parse_config(toml.path());
+    ASSERT_FALSE(r.ok);
+    EXPECT_TRUE(contains(r.error, "切分不可行"));
+}
+
+TEST(WatermarkConfigM2, BothModeAccepted) {
+    const TempFile toml(".toml",
+        std::string(kBaseToml) +
+        "[[passes]]\nname = \"mutate\"\n"
+        "[[functions]]\nname = \"wvmp_mark_foo\"\ncrypt = false\n"
+        "[watermark]\nvalue = \"4D5A9011223344FF\"\nmode = \"both\"\nfragments = 2\n");
+    const auto r = wvmp::cli::parse_config(toml.path());
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.value.watermark.mode, wvmp::wm::WatermarkMode::Both);
+}
+
+// —— M2：registry mode/fragments 与防碰撞 ——
+TEST(WatermarkRegistryM2, ParsesModeAndFragments) {
+    const TempFile reg(".toml",
+        "[[watermarks]]\nid = \"A\"\nvalue = \"4D5A9011223344FF\"\nmode = \"junk\"\n"
+        "[[watermarks]]\nid = \"B\"\nvalue = \"9F8E7D6C5B4A1122\"\nfragments = 2\n");
+    const auto r = wvmp::cli::parse_watermark_registry(reg.path());
+    ASSERT_TRUE(r.ok) << r.error;
+    ASSERT_EQ(r.items.size(), 2u);
+    EXPECT_EQ(r.items[0].mode, wvmp::wm::WatermarkMode::Junk);
+    EXPECT_EQ(r.items[1].mode, wvmp::wm::WatermarkMode::Padding);
+    EXPECT_EQ(r.items[1].fragments, 2u);
+}
+
+TEST(WatermarkRegistryM2, RejectsSimilarPair) {
+    // 两枚都过值域（16-64 hex），且长值在偏移 2 处包含短值（滑窗子串）。
+    const TempFile reg(".toml",
+        "[[watermarks]]\nid = \"Long\"\nvalue = \"AB4D5A9011223344FFCD\"\n"
+        "[[watermarks]]\nid = \"Inner\"\nvalue = \"4D5A9011223344FF\"\n");
+    const auto r = wvmp::cli::parse_watermark_registry(reg.path());
+    ASSERT_FALSE(r.ok);
+    EXPECT_TRUE(contains(r.error, "过相似"));
+    EXPECT_TRUE(contains(r.error, "Long"));
+    EXPECT_TRUE(contains(r.error, "Inner"));
+}
+
+TEST(WatermarkRegistryM2, RejectsWildcardOverlapPair) {
+    // 等长 16 hex，仅两个 '?' 抹平差异 → match_at 全配 = 相似。
+    const TempFile reg(".toml",
+        "[[watermarks]]\nid = \"A\"\nvalue = \"4D5A9011223344FF\"\n"
+        "[[watermarks]]\nid = \"B\"\nvalue = \"4D5A9011??3344FF\"\n");
+    const auto r = wvmp::cli::parse_watermark_registry(reg.path());
+    ASSERT_FALSE(r.ok);
+    EXPECT_TRUE(contains(r.error, "过相似"));
+}
+
+TEST(WatermarkRegistryM2, DisjointPairAccepted) {
+    const TempFile reg(".toml",
+        "[[watermarks]]\nid = \"A\"\nvalue = \"4D5A9011223344FF\"\n"
+        "[[watermarks]]\nid = \"B\"\nvalue = \"9F8E7D6C5B4A1122\"\n");
+    const auto r = wvmp::cli::parse_watermark_registry(reg.path());
+    ASSERT_TRUE(r.ok) << r.error;
+}
+
+// —— M2：scan_file 碎片多数票 ——
+namespace {
+wvmp::cli::ScanItem make_item(const char* value, wvmp::wm::WatermarkMode mode,
+                              wvmp::u32 fragments) {
+    wvmp::cli::ScanItem it;
+    it.watermark.id = "T";
+    it.watermark.value = value;
+    it.watermark.compile();
+    it.mode = mode;
+    it.fragments = fragments;
+    return it;
+}
+} // namespace
+
+TEST(ScanFileM2, FragmentedPaddingMajorityVote) {
+    // fragments=2：两片 4D5A9011 / 223344FF 分散两处。
+    const auto item = make_item("4D5A9011223344FF",
+                                wvmp::wm::WatermarkMode::Padding, 2);
+    std::string content;
+    content += std::string(32, 'x');
+    content += std::string("\x4D\x5A\x90\x11", 4);
+    content += std::string(64, 'y');
+    content += std::string("\x22\x33\x44\xFF", 4);
+    const TempFile bin(".bin", content);
+    const auto rep = wvmp::cli::scan_file(bin.path(), {item});
+    ASSERT_TRUE(rep.ok) << rep.error;
+    ASSERT_TRUE(rep.any_hit);
+    ASSERT_EQ(rep.hits.size(), 1u);
+    EXPECT_EQ(rep.hits[0].count, 2u);
+}
+
+TEST(ScanFileM2, FragmentSinglePieceNotIdentified) {
+    const auto item = make_item("4D5A9011223344FF",
+                                wvmp::wm::WatermarkMode::Padding, 2);
+    std::string content(64, 'x');
+    content += std::string("\x4D\x5A\x90\x11", 4);  // 只有一片
+    const TempFile bin(".bin", content);
+    const auto rep = wvmp::cli::scan_file(bin.path(), {item});
+    ASSERT_TRUE(rep.ok) << rep.error;
+    EXPECT_FALSE(rep.any_hit);
+}
+
+TEST(ScanFileM2, JunkChunksMajorityVote) {
+    // junk 方案：8 字节 → 2 块 4B（模拟 VM 词 aux 面的分散 4 字节块）。
+    const auto item = make_item("4D5A9011223344FF",
+                                wvmp::wm::WatermarkMode::Junk, 1);
+    std::string content;
+    content += std::string(16, 'x');
+    content += std::string("\x22\x33\x44\xFF", 4);  // 块 1（低地址块字节序 = dump 序）
+    content += std::string(16, 'y');
+    content += std::string("\x4D\x5A\x90\x11", 4);  // 块 0
+    const TempFile bin(".bin", content);
+    const auto rep = wvmp::cli::scan_file(bin.path(), {item});
+    ASSERT_TRUE(rep.ok) << rep.error;
+    ASSERT_TRUE(rep.any_hit);
+}
+
+TEST(ScanFileM2, WholePatternNoLongerRequiredForJunkItem) {
+    // junk 条目：整段连续形态不识别（8 字节连排 = 整段匹配面，junk 条目
+    // 按 4B 块投票——连排时两块恰好都中，仍识别；此用例钉"块分散"才是
+    // junk 的目标形态且连排不劣化）。
+    const auto item = make_item("4D5A9011223344FF",
+                                wvmp::wm::WatermarkMode::Junk, 1);
+    std::string content;
+    content += std::string("\x4D\x5A\x90\x11\x22\x33\x44\xFF", 8);
+    const TempFile bin(".bin", content);
+    const auto rep = wvmp::cli::scan_file(bin.path(), {item});
+    ASSERT_TRUE(rep.ok) << rep.error;
+    EXPECT_TRUE(rep.any_hit)
+;  // 连排覆盖两块 → 仍过票
 }

@@ -8,6 +8,7 @@ target_link_libraries(wvmp_mutate_tests PRIVATE
     wvmp::framework
     wvmp::ir
     wvmp::common
+    wvmp_pass_pe_loader  # MIT-541 M2：PeImage 头（kImageMeta 槽测试）
     wvmp::gtest
     gtest_main
 )

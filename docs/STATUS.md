@@ -1656,3 +1656,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 
 ### MIT-541 (水印溯源 v1) ✅ 2026-10-10
 - 交付面 = 分支 `mit-541-watermark`。四件套：common wm 核心库（validate/compile/StreamMatcher，VMProtect 移植钉板）+ [watermark]/--watermark 配置面 + pe_writer 尾垫嵌入（槽缺席=byte-exact 零扰动；预算不足扩 raw 一档再 fail-closed）+ `wvmp scan` 反查子命令 + 发行台账 TSV（sha256 取证指纹，common/sha256 新增 FIPS 180-4）。ctest 25→26 全绿；E2E 六面（嵌入/反查/多态/零误报/行为一致/台账）；10MB×100 枚误匹配实证零命中。局限如实披露（差分攻击同 VMProtect；台账离库；不做运行时自校验）。M2 挂账：碎片分散 + mutate 立即数嵌入。证据链 GAPS「MIT-541」节。
+
+### MIT-541 M2 (水印溯源：碎片分散+junk 词流载体+防碰撞) ✅ 2026-10-10
+- 叠枝同分支续做。①padding 碎片：fragments 2-4 均分片多 span 分散，扫描多数票（K≥2 需 ≥ceil(K/2) 且 ≥2 片）；②junk 载体：crypt 豁免函数 junk-Mov imm32（VM 词 aux 高 4 字节 LE 连续），rng 消费序零扰动（水印开/关 junk 位形逐比特一致），映像窗口折条镜像防线（撞窗槽顺延/恒撞窗块 fail-closed），config 三条一致性校验；③are_similar 移植，registry 两两防碰撞。mode(padding/junk/both)+fragments 键转正。ctest 26/26 + E2E 四面（含 junk 真虚拟化行为一致+词流反查）+ 碎片方案 10MB×100 零误报 + 全池 390/390。挂账：x86 gate 可能拦豁免函数（E2E 为 x64，如实披露）。证据链 GAPS「MIT-541 M2」节。

@@ -107,7 +107,7 @@ wmB_log="$(run_protect "$tmp/wmB.toml")"
 
 echo "$wmA_log" | grep -q "水印 : id=$wm_id" \
     || die "protect 输出缺少水印摘要行"
-echo "$wmA_log" | grep -q "水印已嵌入 3 份" \
+echo "$wmA_log" | grep -q "水印已嵌入 padding 面 3 份 × 1 片" \
     || die "pe_writer 未披露水印嵌入 Note"
 
 out_base="$tmp_win/base.exe"; out_a="$tmp_win/wmA.exe"; out_b="$tmp_win/wmB.exe"

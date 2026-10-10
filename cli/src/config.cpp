@@ -490,16 +490,17 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         result.value.rules.pe_aslr = *aslr;
     }
 
-    // [watermark]（MIT-541 水印溯源 v1）：id/copy 份/台账路径可省略，
-    // value 必填；值域校验见 wm::validate（固定位下限 = 扫描误匹配兜底）。
+    // [watermark]（MIT-541 水印溯源 v1 + M2 碎片/junk 扩展）：value 必填；
+    // 值域校验见 wm::validate，模式相关布局校验见 wm::check_layout。
     if (const toml::node* wm_node = tbl.get("watermark")) {
         const toml::table* wt = wm_node->as_table();
         if (!wt) return fail("config 字段 'watermark' 必须是表（[watermark]）");
         for (const auto& [key, value] : *wt)
             if (key.str() != "id" && key.str() != "value" && key.str() != "copies" &&
-                key.str() != "issue_log")
+                key.str() != "issue_log" && key.str() != "mode" &&
+                key.str() != "fragments")
                 return fail("config [watermark] 未知子键 '" + std::string(key.str()) +
-                            "'（允许: id/value/copies/issue_log）");
+                            "'（允许: id/value/copies/issue_log/mode/fragments）");
         WatermarkConfig wc;
         auto v = (*wt)["value"].value<std::string>();
         if (!v || v->empty())
@@ -518,6 +519,28 @@ ConfigResult parse_config(const std::filesystem::path& file) {
                 return fail("config [watermark] 'copies' 必须是 1-8 的整数（嵌入份数）");
             wc.copies = static_cast<u32>(*copies);
         }
+        if (const toml::node* mn = wt->get("mode")) {
+            auto mode = mn->value<std::string>();
+            if (!mode)
+                return fail("config [watermark] 'mode' 必须是字符串"
+                            "（padding/junk/both）");
+            if (*mode == "padding")
+                wc.mode = wvmp::wm::WatermarkMode::Padding;
+            else if (*mode == "junk")
+                wc.mode = wvmp::wm::WatermarkMode::Junk;
+            else if (*mode == "both")
+                wc.mode = wvmp::wm::WatermarkMode::Both;
+            else
+                return fail("config [watermark] 'mode' 非法值 '" + *mode +
+                            "'（允许: padding/junk/both）");
+        }
+        if (const toml::node* fn = wt->get("fragments")) {
+            auto frags = fn->value<std::int64_t>();
+            if (!frags || *frags < 1 || *frags > 4)
+                return fail("config [watermark] 'fragments' 必须是 1-4 的整数"
+                            "（padding 面碎片数）");
+            wc.fragments = static_cast<u32>(*frags);
+        }
         if (const toml::node* iln = wt->get("issue_log")) {
             auto il = iln->value<std::string>();
             if (!il || il->empty())
@@ -529,6 +552,36 @@ ConfigResult parse_config(const std::filesystem::path& file) {
         std::string why;
         if (!wvmp::wm::validate(wc.id, wc.value, &why))
             return fail("config [watermark] " + why);
+        // M2 模式相关校验（值布局 + junk 载体一致性，全部 fail-closed）。
+        if (wc.mode == wvmp::wm::WatermarkMode::Junk && wc.fragments > 1)
+            return fail("config [watermark] mode=junk 无 padding 面，fragments "
+                        "必须为 1（junk 面恒按 4 字节块切）");
+        wvmp::wm::Watermark compiled;
+        compiled.id = wc.id;
+        compiled.value = wc.value;
+        compiled.compile();
+        if (!wvmp::wm::check_layout(compiled, wc.mode, wc.fragments, &why))
+            return fail("config [watermark] " + why);
+        if (wc.mode != wvmp::wm::WatermarkMode::Padding) {
+            // junk 载体一致性①：crypt 默认全加密（XorChain），密文 blob 里
+            // 的 junk imm 文件级不可扫——必须存在至少一条 [[functions]]
+            // crypt=false 豁免作为明文载体。
+            bool has_exemption = false;
+            for (const auto& fr : result.value.rules.functions)
+                if (fr.has_crypt && !fr.crypt) has_exemption = true;
+            if (!has_exemption)
+                return fail("config [watermark] mode 含 junk 但没有 [[functions]] "
+                            "crypt=false 豁免——junk-Mov 水印落在 VM 词流里，"
+                            "默认全加密后文件级扫描不可见；须豁免至少一个虚拟化"
+                            "函数作明文载体");
+            // ②：载体发射方 mutate pass 必须在管道里。
+            bool has_mutate = false;
+            for (const auto& p : result.value.passes)
+                if (p.name == "mutate") has_mutate = true;
+            if (!has_mutate)
+                return fail("config [watermark] mode 含 junk 但管道未装配 mutate "
+                            "pass——junk-Mov 水印由 mutate 发射，缺载体");
+        }
         result.value.has_watermark = true;
         result.value.watermark = std::move(wc);
     }
@@ -584,9 +637,10 @@ WatermarkRegistryResult parse_watermark_registry(const std::filesystem::path& fi
             "registry 'watermarks[" + std::to_string(index) + "]'";
         // 严格 schema（同 [[passes]] 口径）。
         for (const auto& [key, value] : *entry) {
-            if (key.str() != "id" && key.str() != "value") {
+            if (key.str() != "id" && key.str() != "value" &&
+                key.str() != "mode" && key.str() != "fragments") {
                 result.error = where + " 未知字段 '" + std::string(key.str()) +
-                               "'（只允许 id/value）";
+                               "'（只允许 id/value/mode/fragments）";
                 return result;
             }
         }
@@ -600,27 +654,75 @@ WatermarkRegistryResult parse_watermark_registry(const std::filesystem::path& fi
             result.error = where + " 缺少必填字段 'value'（十六进制 + '?')";
             return result;
         }
+        ScanItem item;
+        item.watermark.id = *id;
+        item.watermark.value = *val;
+        if (const toml::node* mn = entry->get("mode")) {
+            auto mode = mn->value<std::string>();
+            if (!mode) {
+                result.error = where + " 'mode' 必须是字符串（padding/junk/both）";
+                return result;
+            }
+            if (*mode == "padding")
+                item.mode = wvmp::wm::WatermarkMode::Padding;
+            else if (*mode == "junk")
+                item.mode = wvmp::wm::WatermarkMode::Junk;
+            else if (*mode == "both")
+                item.mode = wvmp::wm::WatermarkMode::Both;
+            else {
+                result.error = where + " 'mode' 非法值 '" + *mode +
+                               "'（允许: padding/junk/both）";
+                return result;
+            }
+        }
+        if (const toml::node* fn = entry->get("fragments")) {
+            auto frags = fn->value<std::int64_t>();
+            if (!frags || *frags < 1 || *frags > 4) {
+                result.error = where + " 'fragments' 必须是 1-4 的整数";
+                return result;
+            }
+            item.fragments = static_cast<u32>(*frags);
+        }
+        if (item.mode == wvmp::wm::WatermarkMode::Junk && item.fragments > 1) {
+            result.error = where + " mode=junk 无 padding 面，fragments 必须为 1";
+            return result;
+        }
         std::string why;
-        if (!wvmp::wm::validate(*id, *val, &why)) {
+        if (!wvmp::wm::validate(item.watermark.id, item.watermark.value, &why)) {
             result.error = where + " " + why;
             return result;
         }
-        wvmp::wm::Watermark wm;
-        wm.id = *id;
-        wm.value = *val;
         try {
-            wm.compile();
+            item.watermark.compile();
         } catch (const std::exception& e) {
             result.error = where + " " + e.what();
             return result;
         }
-        result.items.push_back(std::move(wm));
+        if (!wvmp::wm::check_layout(item.watermark, item.mode, item.fragments,
+                                    &why)) {
+            result.error = where + " " + why;
+            return result;
+        }
+        result.items.push_back(std::move(item));
         ++index;
     }
     if (result.items.empty()) {
         result.error = "registry [[watermarks]] 为空（至少登记一枚水印）";
         return result;
     }
+    // M2 防碰撞：两两过相似（'?' 通配 + 大小写不敏感包含）→ 拒绝整个
+    // 登记表（扫描到短片误报长枚 = 误归因，宁可拒绝重建表）。
+    for (size_t a = 0; a < result.items.size(); ++a)
+        for (size_t b = a + 1; b < result.items.size(); ++b)
+            if (wvmp::wm::are_similar(result.items[a].watermark.value,
+                                      result.items[b].watermark.value)) {
+                result.error =
+                    "registry 水印过相似（误归因风险）：'" +
+                    result.items[a].watermark.id + "' 与 '" +
+                    result.items[b].watermark.id +
+                    "'（'?' 通配 + 大小写不敏感语义下存在包含关系）";
+                return result;
+            }
     result.ok = true;
     return result;
 }
