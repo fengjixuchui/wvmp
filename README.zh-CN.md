@@ -1,11 +1,11 @@
 # WVmp（中文）
 
-一个自研的 PE 虚拟机保护壳。将 x86/x64 Windows 可执行文件中的标记区域翻译为自研的寄存器式虚拟机（164 ops，跳表调度），通过 stub-link 派发回原 native 代码。
+一个自研的 PE 虚拟机保护壳。将 x86/x64 Windows 可执行文件中的标记区域翻译为自研的寄存器式虚拟机（169 ops，跳表调度），通过 stub-link 派发回原 native 代码。
 
 ![x64 direct](https://img.shields.io/badge/x64_direct-99.26%25-brightgreen)
 ![x86 direct](https://img.shields.io/badge/x86_direct-95.15%25-green)
 ![wvmpTest x86](https://img.shields.io/badge/wvmpTest_x86-96.3%25-yellowgreen)
-![baseline](https://img.shields.io/badge/baseline-360%2F360-brightgreen)
+![baseline](https://img.shields.io/badge/baseline-390%2F390-brightgreen)
 
 > **语言**： [English](README.md) | **简体中文**
 
@@ -16,9 +16,9 @@
 | **x64 (PE32+)** | 0x8664 | **生产可用** |
 | **x86 (PE32)** | 0x14C | **生产可用**（WOW64 已验证）|
 
-Native 客户端代码路径不变。被标记的区域（两段连续 8 字节 magic）翻译为自研寄存器式虚拟机（164 ops，跳表 256 项）。输出在 `byte-exact` 校验下保持行为字节级一致——完整支持矩阵见 [docs/GAPS.md](docs/GAPS.md) 的**「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」节**：该节是本文所有量化读数（`kVmOpMax` 164 / 跳表 256 / baseline 360 / x87 与 ymm 的 arch 归属 / gate 分档）的**单一真源**。两处不一致时以 GAPS 为准，本文件的这一格即为待修错误。
+Native 客户端代码路径不变。被标记的区域（两段连续 8 字节 magic）翻译为自研寄存器式虚拟机（169 ops，跳表 256 项）。输出在 `byte-exact` 校验下保持行为字节级一致——完整支持矩阵见 [docs/GAPS.md](docs/GAPS.md) 的**「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」节**：该节是本文所有量化读数（`kVmOpMax` 169 / 跳表 256 / baseline 390 / x87 与 ymm 的 arch 归属 / gate 分档）的**单一真源**。两处不一致时以 GAPS 为准，本文件的这一格即为待修错误。
 
-指令面亮点（2026-09）：**AVX/VEX.256**——x64 侧完整 ymm 数据通路（`vmov*` + 18 条 packed 算术、`vzeroupper`/`vzeroall`、按需 stub ymm 同步）；**x87 FPU**——x86 侧虚拟化（L0–L4：load/store、比较、fcmov、超越函数）。两者在另一侧架构均按架构 gate 处理——见下方 Gate 边界。
+指令面亮点（2026-09 ~ 10）：**AVX/VEX.256**——x64 侧完整 ymm 数据通路（`vmov*` + 18 条 packed 算术、`vzeroupper`/`vzeroall`、按需 stub ymm 同步）及 `vextractf128`/`vinsertf128` 桥（MIT-533）；**x87 FPU**——x86 侧虚拟化（L0–L4：load/store、比较、fcmov、超越函数）；**VEX-GP BMI2**——`mulx`/`pdep`/`pext` 寄存器形在 x64 侧 native 直发（MIT-534，最低机器契约已接受，`[bmi2] require` 开关）。各指令族在另一侧架构均按架构 gate 处理——见下方 Gate 边界。
 
 ## Gate 边界（已文档化，非缺陷）
 
@@ -37,8 +37,7 @@ Native 客户端代码路径不变。被标记的区域（两段连续 8 字节 
 | 指令族 | 重审触发条件 |
 |---|---|
 | legacy SSE 与 ymm 同函数混排 | 整函数保持 native；出现真实保护样本需要混排协议时翻面（MIT-514）。|
-| `vextractf128`/`vinsertf128` 水平操作 | +2 VmOp 桥；已在 intrinsic 归约代码中实证存在（MIT-520），同一触发条件入面。|
-| VEX-GP BMI2（`mulx`/`pdep`/`pext`）| 待 BMI2 最低机器产品决策；`mulx` 不修改 CF/ZF 已在 Zen5 实测钉死（MIT-515）。|
+| VEX-GP BMI2 **mem 形**（`mulx`/`pdep`/`pext` 带内存操作数）| `/Od` intrinsic 代码生成恒为 mem 形，此类函数当前保持 native；寄存器形已入面（MIT-534）。支持路径沿用 SSE mem 源通路（MIT-408 同款）。|
 
 **永久**：
 
@@ -47,11 +46,43 @@ Native 客户端代码路径不变。被标记的区域（两段连续 8 字节 
 | 间接 jmp（`jmp [mem]`/`jmp reg`）| 静态可分析的"表形"在 System32 / SysWOW64 全语料中占比 < 0.001%；主导形态需要 L 级运行时分析。（MIT-455 §3.2、MIT-494x。）|
 | SEH（`fs:[...]`）/段覆盖 | 需要与 Windows 异常派发器协作，超出当前研究线范围。|
 
-历史注记：x87 与 mul64hi 栈深边界曾是永久 gate——两者均已翻案（x87 → 分架构虚拟化，MIT-509/510；mul64hi → esp-resync 前瞻 + callee `ret N` 扫描，MIT-497/500，x86 22/22 区域全虚拟化）。当前状态表见 [docs/GAPS.md](docs/GAPS.md)。
+历史注记：x87 与 mul64hi 栈深边界曾是永久 gate——两者均已翻案（x87 → 分架构虚拟化，MIT-509/510；mul64hi → esp-resync 前瞻 + callee `ret N` 扫描，MIT-497/500，x86 22/22 区域全虚拟化）。两条原频率 gate 项也已落地：`vextractf128`/`vinsertf128` 桥（+2 VmOp，MIT-533）与 BMI2 最低机器契约及寄存器形直发（+3 VmOp，MIT-534，2026-09-28 用户接受）。当前状态表见 [docs/GAPS.md](docs/GAPS.md)。
 
 ## 配置（TOML）
 
-打包行为经 TOML 配置：每函数保护档位（`default_level` + `[[functions]]` 规则，MIT-457）与 `[avx] require`（默认 `true`；置 `false` 时含 AVX 词的函数保持 native，使打包产物可在非 AVX 机器上运行，MIT-518）。
+打包行为经 TOML 配置：每函数保护档位（`default_level` + `[[functions]]` 规则，MIT-457）、每函数 crypt 豁免（`[[functions]] crypt = false`）、机器契约开关 `[avx] require` / `[bmi2] require`（默认 `true`；置 `false` 时含 AVX/BMI2 词的函数保持 native，使打包产物可在老机器上运行，MIT-518/534），以及泄露溯源用的 `[watermark]`（见下一节）。
+
+## 水印溯源（泄露副本反查发行对象）
+
+2026-10-10 交付（MIT-541 v1 + M2 + MIT-542）。每个保护副本可携带唯一水印；副本泄露后用 `wvmp scan` 反查出自哪次发行。
+
+**保护时嵌入**——`[watermark]` 三种 `mode`（`padding` / `junk` / `both`，默认 `padding`；值为十六进制 + `?` 半字节通配，16-64 字符、固定位 ≥12）：
+
+```toml
+[watermark]
+id     = "Customer_A"        # 缺省 = value 前 8 字符
+value  = "4D5A90??1A2B3C4D"
+copies = 3                   # 冗余份数（1-8）
+mode   = "padding"           # padding | junk | both
+fragments = 2                # padding 面：切 2-4 片分散嵌入
+issue_log = "watermark_issues.tsv"  # 发行台账（TSV）
+```
+
+- **padding**——模式（或分散碎片）落在产出节表尾垫内；扫描端按碎片多数票识别。
+- **junk**——水印 4 字节块骑在 **crypt 豁免函数**（`[[functions]] crypt = false`）的 junk-Mov `imm32` 里，即明文 blob 的 VM 词流内部。要求管道含 `mutate` 且值字节为 4 的倍数；任一块未能在明文 blob 面核实可见即打包失败（MIT-542 结果级核对——覆盖 x86 白名单 gate 把载体函数保持原生的情形）。
+- **both**——两面都嵌；junk 面失效降级为警告，padding 面仍携带水印。
+
+`--watermark <value>` 按次覆盖配置值。
+
+**泄露副本反查**：
+
+```bat
+wvmp scan --in leaked.exe --registry watermarks.toml
+```
+
+登记表列已知水印（`[[watermarks]]` id/value/mode/fragments）；过相似对在解析期拒绝（通配感知的包含关系，VMProtect `AreSimilar` 移植）。命中退出码 0、全未命中 1——可脚本化批量筛查。发行台账（时间/id/值/seed/sha256 前 16/输出路径）把 ID 回答到"这份副本发给了谁"；台账含全部水印明文，已入 .gitignore，须与源码分开保管。
+
+fail-closed 契约：配置了水印但无法嵌全（无载体/预算不足/块不可见）**直接构建失败**——绝不静默产出不可溯源副本。如实披露的局限：静态水印不抗双副本差分攻击（与 VMProtect 同级，"抗移除=中"）；碎片 + 词流面抬高攻击成本但不根除。明确不做运行时自校验（会给抹除者提供 oracle）。
 
 ## 构建（Windows / MSVC / Ninja，需 VS 18 Insiders）
 
@@ -135,13 +166,15 @@ WVmp 自 2026-08-29 起通过 [multica](https://github.com/multica-ai/multica) �
 | M2.5-X 多目标平台（x86 生产可用）| 已完成（2026-09-03）|
 | M3 保护表面（工作流 1–5）| **v1 已交付**（2026-09，MIT-456 波次）——见后续开发计划 |
 | 指令面扩展（x86 x87 / x64 ymm+AVX / BMI2 备忘录）| 已完成（2026-09-14，MIT-509–521）|
-| 频率 gate 指令积压 | 开放，样本驱动（SSE+ymm 混排、`vextractf128` 桥、BMI2 契约——MIT-521）|
+| BMI2 寄存器形 + `vextractf128`/`vinsertf128` 桥 | 已完成（2026-09-28，MIT-534/533；kVmOpMax 164→169）|
+| 水印溯源（泄露副本反查）| 已完成（2026-10-10，MIT-541 + M2 + 542）|
+| 频率 gate 指令积压 | 开放，样本驱动（SSE+ymm 混排、BMI2 mem 形——MIT-521/534）|
 | 产品表面（工作流 6 GUI）| 未开始，已被工作流 1–5 解锁 |
 | 扩展表面（工作流 7–9）| park，等触发 |
 
 ## 后续开发计划
 
-九条能力工作流规划于 M2.5-G + M2.5-X 收官之后，是 WVmp 的**独立产品**。**工作流 1–5 已于 2026 年 9 月交付 v1**（MIT-456 波次）：五个保护 pass 全部实体化、接入流水线、可按函数配置。工作流 6（GUI）与工作流 7–9 维持后续工作。当前开放积压 = Gate 边界节列出的频率 gate 指令集——SSE+ymm 混排协议、`vextractf128`/`vinsertf128` 桥、BMI2 最低机器决策——全部证据驱动（MIT-521）。
+九条能力工作流规划于 M2.5-G + M2.5-X 收官之后，是 WVmp 的**独立产品**。**工作流 1–5 已于 2026 年 9 月交付 v1**（MIT-456 波次）：五个保护 pass 全部实体化、接入流水线、可按函数配置。工作流 6（GUI）与工作流 7–9 维持后续工作。原频率 gate 挂账中，`vextractf128`/`vinsertf128` 桥与 BMI2 最低机器契约（寄存器形）已落地（MIT-533/534）；剩余积压 = SSE+ymm 混排协议与 BMI2 mem 形——全部证据驱动（MIT-521）。水印溯源（2026-10，MIT-541/542）在工作流图谱之外作为泄露识别能力交付，构建在工作流 1–5 之上。
 
 ### 工作流 1：字节码密码学混淆 —— v1 已交付（MIT-458）
 
@@ -230,7 +263,7 @@ PEB.BeingDebugged + NtGlobalFlag 检查 + FailFast 响应（MIT-463），经 TLS
 
 **当前顺序**：
 
-1. **频率 gate 指令积压**——样本驱动（MIT-521）：SSE+ymm 混排协议翻面、`vextractf128`/`vinsertf128` 桥（+2 VmOp）、BMI2 最低机器产品决策（技术侧无阻塞，MIT-515）。
+1. **频率 gate 指令积压**——样本驱动（MIT-521）：SSE+ymm 混排协议翻面与 BMI2 mem 形支持（桥与寄存器形已落地，MIT-533/534）。
 2. **工作流 6（GUI）**——已被交付的工作流 1–5 解锁。
 3. **工作流 7–9**——park，等各自外部触发，不变。
 
@@ -246,19 +279,19 @@ PEB.BeingDebugged + NtGlobalFlag 检查 + FailFast 响应（MIT-463），经 TLS
 [Marked regions]
    ↓ lifter                 ← capstone 解码 → IR
 [IR]                       ← 冻结载体域（ir::Op）
-   ↓ virtualize             ← IR → VmOp 表（kVmOpMax=164）
+   ↓ virtualize             ← IR → VmOp 表（kVmOpMax=169）
 [VmOp sequence]
    ↓ stub_link              ← 生成 stub 派发入口
 [Protected PE]
 ```
 
-实现位于 `vm/regvm/{backend,lifter,translator,runtime}/`，passes 注册在 `passes/{pe_loader,marker_scan,lifter,virtualize,stub_link,pe_writer}/`，CLI 在 `cli/`。
+实现位于 `vm/regvm/{backend,lifter,translator,runtime}/`，核心 passes 注册在 `passes/{pe_loader,marker_scan,lifter,mutate,virtualize,stub_link,pe_writer}/`，M3 保护 passes 在 `passes/{crypt,anti_debug,integrity_crc,import_protect,tls_hook}/`，水印核心库在 `common/src/wm/`，CLI（protect / scan / version）在 `cli/`。
 
 ## 仓库结构
 
 ```
 WVmp/
-├── cli/                       # WVmp CLI（protect 子命令）
+├── cli/                       # WVmp CLI（protect / scan 子命令）
 ├── passes/                    # 流水线 passes（pe_loader、marker_scan、…）
 ├── vm/regvm/                  # VM 实现（lifter、translator、runtime、backend）
 ├── sdk/include/wvmp/          # 公共 SDK 头文件
@@ -270,7 +303,9 @@ WVmp/
 ├── scripts/
 │   ├── build.bat              # MSVC + Ninja 构建
 │   ├── test.bat               # ctest
-│   ├── multiseed_e2e.sh       # 5 seed × 72 样本回归池
+│   ├── multiseed_e2e.sh       # 5 seed × 78 样本回归池
+│   ├── watermark_e2e.sh       # 水印 E2E（嵌入/反查/多态/台账）
+│   ├── watermark_e2e_m2.sh    # 水印 E2E（碎片/junk/both/负例）
 │   └── verifier/
 │       ├── mit_x7_rescan.py       # 客户态覆盖率扫描器
 │       ├── mit_515_bmi_probe/     # BMI2（mulx/pdep/pext）硬件探针

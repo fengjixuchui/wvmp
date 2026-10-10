@@ -7,7 +7,7 @@ A self-researched PE virtual-machine protector. Translates marked regions of x86
 ![x64 direct](https://img.shields.io/badge/x64_direct-99.26%25-brightgreen)
 ![x86 direct](https://img.shields.io/badge/x86_direct-95.15%25-green)
 ![wvmpTest x86](https://img.shields.io/badge/wvmpTest_x86-96.3%25-yellowgreen)
-![baseline](https://img.shields.io/badge/baseline-360%2F360-brightgreen)
+![baseline](https://img.shields.io/badge/baseline-390%2F390-brightgreen)
 
 ## Targets
 
@@ -16,9 +16,9 @@ A self-researched PE virtual-machine protector. Translates marked regions of x86
 | **x64 (PE32+)** | 0x8664 | **Production ready** |
 | **x86 (PE32)** | 0x14C | **Production ready** (WOW64 verified) |
 
-Native client code paths are unchanged. Marked regions (two consecutive 8-byte markers) are translated to a custom register-based VM (164 ops, jump table 256 entries). Output preserves byte-identical behavior under `byte-exact` verification — see [docs/GAPS.md](docs/GAPS.md), section **「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」**: that section is the **single source of truth** for every figure in this README (`kVmOpMax` 164 / jump table 256 / baseline 360 / x87 and ymm arch split / gate classes). Where the two disagree, GAPS wins and this file is the bug.
+Native client code paths are unchanged. Marked regions (two consecutive 8-byte markers) are translated to a custom register-based VM (169 ops, jump table 256 entries). Output preserves byte-identical behavior under `byte-exact` verification — see [docs/GAPS.md](docs/GAPS.md), section **「指令族支持矩阵（当前口径，2026-09-19 实测 · 单一真源）」**: that section is the **single source of truth** for every figure in this README (`kVmOpMax` 169 / jump table 256 / baseline 390 / x87 and ymm arch split / gate classes). Where the two disagree, GAPS wins and this file is the bug.
 
-Instruction surface highlights (September 2026): **AVX/VEX.256** — a full ymm data path on x64 (`vmov*` + 18 packed-arithmetic ops, `vzeroupper`/`vzeroall`, on-demand ymm stub sync); **x87 FPU** — virtualized on x86 (L0–L4: load/store, compare, fcmov, transcendentals). Each is architecture-gated on the opposite arch — see Gate boundaries below.
+Instruction surface highlights (September–October 2026): **AVX/VEX.256** — a full ymm data path on x64 (`vmov*` + 18 packed-arithmetic ops, `vzeroupper`/`vzeroall`, on-demand ymm stub sync), plus the `vextractf128`/`vinsertf128` bridge (MIT-533); **x87 FPU** — virtualized on x86 (L0–L4: load/store, compare, fcmov, transcendentals); **VEX-GP BMI2** — `mulx`/`pdep`/`pext` register forms native-dispatched on x64 (MIT-534, minimum-machine contract accepted, `[bmi2] require` switch). Each family is architecture-gated on the opposite arch — see Gate boundaries below.
 
 ## Gate boundaries (documented, not bugs)
 
@@ -37,8 +37,7 @@ Regions containing gated instructions remain native and produce byte-identical o
 | Family | Trigger to revisit |
 |---|---|
 | legacy SSE + ymm mixed in one function | Whole function stays native; flip the mixed-protocol support when a real protection sample requires it (MIT-514). |
-| `vextractf128`/`vinsertf128` horizontal ops | +2 VmOp bridge; proven present in intrinsic reduction code (MIT-520), enters on the same trigger. |
-| VEX-GP BMI2 (`mulx`/`pdep`/`pext`) | Pending the BMI2 minimum-machine product decision; `mulx` CF/ZF non-modification verified on Zen5 (MIT-515). |
+| VEX-GP BMI2 **memory forms** (`mulx`/`pdep`/`pext` with a memory operand) | `/Od` intrinsic codegen always emits mem forms, so such functions currently stay native; register forms shipped (MIT-534). Support follows the SSE mem-operand path (MIT-408 pattern). |
 
 **Permanent**:
 
@@ -47,11 +46,43 @@ Regions containing gated instructions remain native and produce byte-identical o
 | Indirect jmp (`jmp [mem]`/`jmp reg`) | Statically analyzable "table form" is < 0.001% of all indirect jumps in System32 / SysWOW64; dominant forms require L-level runtime analysis. (MIT-455 §3.2, MIT-494x.) |
 | SEH (`fs:[...]`) / segment overrides | Requires cooperation with the Windows exception dispatcher; out of scope for the current research line. |
 
-Historical note: x87 and the mul64hi stack-depth boundary were formerly permanent gates — both have since been resolved (x87 → per-arch virtualization, MIT-509/510; mul64hi → esp-resync lookahead + callee `ret N` scanning, MIT-497/500, x86 22/22 regions virtualized). The current status table lives in [docs/GAPS.md](docs/GAPS.md).
+Historical note: x87 and the mul64hi stack-depth boundary were formerly permanent gates — both have since been resolved (x87 → per-arch virtualization, MIT-509/510; mul64hi → esp-resync lookahead + callee `ret N` scanning, MIT-497/500, x86 22/22 regions virtualized). Two formerly frequency-gated rows also landed: the `vextractf128`/`vinsertf128` bridge (+2 VmOp, MIT-533) and the BMI2 minimum-machine contract with register-form dispatch (+3 VmOp, MIT-534, user-accepted 2026-09-28). The current status table lives in [docs/GAPS.md](docs/GAPS.md).
 
 ## Configuration (TOML)
 
-Pack-time behavior is configured via TOML: per-function protection levels (`default_level` plus `[[functions]]` rules, MIT-457) and `[avx] require` (default `true`; set `false` to keep AVX-word functions native so packed binaries still run on non-AVX machines, MIT-518).
+Pack-time behavior is configured via TOML: per-function protection levels (`default_level` plus `[[functions]]` rules, MIT-457), per-function crypt exemptions (`[[functions]] crypt = false`), machine-contract switches `[avx] require` / `[bmi2] require` (default `true`; set `false` to keep AVX/BMI2-word functions native so packed binaries still run on older machines, MIT-518/534), and `[watermark]` for leak-source identification (see the next section).
+
+## Watermark tracing (leak-source identification)
+
+Shipped 2026-10-10 (MIT-541 v1 + M2 + MIT-542). Every protected copy can carry a unique watermark; when a copy leaks, `wvmp scan` reverse-identifies which issuance it came from.
+
+**Embed at protect time** — three modes via `[watermark]` (`mode` = `padding` / `junk` / `both`, default `padding`; value is hex + `?` nibble wildcards, 16–64 chars, ≥12 fixed chars):
+
+```toml
+[watermark]
+id     = "Customer_A"        # defaults to the first 8 chars of value
+value  = "4D5A90??1A2B3C4D"
+copies = 3                   # redundancy (1-8)
+mode   = "padding"           # padding | junk | both
+fragments = 2                # padding face: split into 2-4 scattered fragments
+issue_log = "watermark_issues.tsv"  # issuance ledger (TSV)
+```
+
+- **padding** — copies of the pattern (or scattered fragments) live in the FileAlignment tail padding of emitted sections; scanner identification is by majority vote across fragments.
+- **junk** — 4-byte watermark chunks ride the junk-Mov `imm32` immediates of **crypt-exempted** functions (`[[functions]] crypt = false`), i.e. inside the VM word stream of a plaintext blob. Requires `mutate` in the pipeline and a 4-byte-aligned value; the pack fails closed if any chunk is not verifiably visible in the plaintext blob face (MIT-542 outcome-level check — covers the x86 whitelist gate keeping the carrier native).
+- **both** — both faces; a dead junk face downgrades to a warning while padding still carries the watermark.
+
+`--watermark <value>` overrides the configured value per invocation.
+
+**Trace a leaked copy**:
+
+```bat
+wvmp scan --in leaked.exe --registry watermarks.toml
+```
+
+The registry lists known watermarks (`[[watermarks]]` id/value/mode/fragments); overly similar pairs are rejected at parse (wildcard-aware containment, VMProtect `AreSimilar` port). Exit code 0 on identification, 1 on no hit — scriptable for batch screening. The issuance ledger (timestamp / id / value / seed / sha256-16 / output path) closes the loop from ID back to "who received this copy"; it holds all watermark plaintexts, so it is gitignored and must stay out of source control.
+
+Fail-closed contract: a configured watermark that cannot be fully embedded (no carrier, insufficient budget, invisible chunks) **fails the build** — an untraceable copy is never produced silently. Disclosed limitation: static watermarks do not survive a two-copy differential attack (same class as VMProtect, "removal-resistance = medium"); fragments + the word-stream face raise the cost but do not eliminate it. No runtime self-verification by design (it would give a removal oracle).
 
 ## Build (Windows / MSVC / Ninja, requires VS 18 Insiders)
 
@@ -137,13 +168,15 @@ WVmp development is driven by [multica](https://github.com/multica-ai/multica) �
 | M2.5-X multi-target platform (x86 production) | Done (2026-09-03) |
 | M3 protection surface (Streams 1–5) | **v1 shipped** (2026-09, MIT-456 wave) — see Roadmap |
 | Instruction-surface extension (x87 x86 / ymm+AVX x64 / BMI2 memo) | Done (2026-09-14, MIT-509–521) |
-| Frequency-gated instruction backlog | Open, sample-driven (mixed SSE+ymm, `vextractf128` bridge, BMI2 contract — MIT-521) |
+| BMI2 register forms + `vextractf128`/`vinsertf128` bridge | Done (2026-09-28, MIT-534/533; kVmOpMax 164→169) |
+| Watermark tracing (leak-source identification) | Done (2026-10-10, MIT-541 + M2 + 542) |
+| Frequency-gated instruction backlog | Open, sample-driven (mixed SSE+ymm, BMI2 mem forms — MIT-521/534) |
 | Product surface (Stream 6 GUI) | Not started, unblocked by Streams 1–5 |
 | Extended surface (Streams 7–9) | Parked pending trigger |
 
 ## Roadmap
 
-The nine capability streams were charted after the M2.5-G + M2.5-X close-out as **independent products** of WVmp. **Streams 1–5 shipped v1 in September 2026** (MIT-456 wave): the five protective passes are real, pipeline-wired, and configurable per function. Stream 6 (GUI) and Streams 7–9 remain future work. The currently open backlog is the frequency-gated instruction set listed under Gate boundaries — mixed SSE+ymm protocol, `vextractf128`/`vinsertf128` bridge, and the BMI2 minimum-machine decision — all evidence-driven (MIT-521).
+The nine capability streams were charted after the M2.5-G + M2.5-X close-out as **independent products** of WVmp. **Streams 1–5 shipped v1 in September 2026** (MIT-456 wave): the five protective passes are real, pipeline-wired, and configurable per function. Stream 6 (GUI) and Streams 7–9 remain future work. Of the formerly open frequency-gated items, the `vextractf128`/`vinsertf128` bridge and the BMI2 minimum-machine contract (register forms) have since shipped (MIT-533/534); the remaining backlog is the mixed SSE+ymm protocol and BMI2 memory forms — evidence-driven (MIT-521). Watermark tracing (October 2026, MIT-541/542) shipped outside the nine-stream chart as a leak-identification capability on top of Streams 1–5.
 
 ### Stream 1: bytecode cryptographic obfuscation — shipped v1 (MIT-458)
 
@@ -232,7 +265,7 @@ Hook-based re-direction of host-OS file and registry I/O — emulated resources 
 
 **Current order**:
 
-1. **Frequency-gated instruction backlog** — sample-driven (MIT-521): mixed SSE+ymm protocol flip, `vextractf128`/`vinsertf128` bridge (+2 VmOp), and the BMI2 minimum-machine product decision (technical side unblocked, MIT-515).
+1. **Frequency-gated instruction backlog** — sample-driven (MIT-521): mixed SSE+ymm protocol flip and BMI2 memory forms (register forms + bridge shipped, MIT-533/534).
 2. **Stream 6 (GUI)** — unblocked by the shipped Streams 1–5.
 3. **Streams 7–9** — parked on their external triggers, unchanged.
 
@@ -248,19 +281,19 @@ When Streams 1–5 shipped, their internal ordering (crypt → mutate → anti_d
 [Marked regions]
    ↓ lifter                 ← capstone decode → IR
 [IR]                       ← frozen carrier domain (ir::Op)
-   ↓ virtualize             ← IR → VmOp table (kVmOpMax=164)
+   ↓ virtualize             ← IR → VmOp table (kVmOpMax=169)
 [VmOp sequence]
    ↓ stub_link              ← generate stub dispatch entry
 [Protected PE]
 ```
 
-The implementation lives in `vm/regvm/{backend,lifter,translator,runtime}/`, with passes registered in `passes/{pe_loader,marker_scan,lifter,virtualize,stub_link,pe_writer}/` and the CLI in `cli/`.
+The implementation lives in `vm/regvm/{backend,lifter,translator,runtime}/`, with core passes registered in `passes/{pe_loader,marker_scan,lifter,mutate,virtualize,stub_link,pe_writer}/`, the M3 protective passes in `passes/{crypt,anti_debug,integrity_crc,import_protect,tls_hook}/`, the watermark core in `common/src/wm/`, and the CLI (protect / scan / version) in `cli/`.
 
 ## Repository layout
 
 ```
 WVmp/
-├── cli/                       # WVmp CLI (protect subcommand)
+├── cli/                       # WVmp CLI (protect / scan subcommands)
 ├── passes/                    # pipeline passes (pe_loader, marker_scan, ...)
 ├── vm/regvm/                  # VM implementation (lifter, translator, runtime, backend)
 ├── sdk/include/wvmp/          # public SDK headers
@@ -272,7 +305,9 @@ WVmp/
 ├── scripts/
 │   ├── build.bat              # MSVC + Ninja build
 │   ├── test.bat               # ctest
-│   ├── multiseed_e2e.sh       # 5-seed x 72 sample regression pool
+│   ├── multiseed_e2e.sh       # 5-seed x 78 sample regression pool
+│   ├── watermark_e2e.sh       # watermark E2E (embed/scan/polymorphic/ledger)
+│   ├── watermark_e2e_m2.sh    # watermark E2E (fragments/junk/both/negative)
 │   └── verifier/
 │       ├── mit_x7_rescan.py       # client-state coverage scanner
 │       ├── mit_515_bmi_probe/     # BMI2 (mulx/pdep/pext) hardware probe
