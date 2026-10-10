@@ -12,6 +12,7 @@
 #include "wvmp/passes/pe_loader/pe_image.hpp"
 #include "wvmp/passes/virtualize/virtualize_pass.hpp"
 #include "wvmp/passes/crypt/crypt_plan.hpp"
+#include "wvmp/wm/watermark.hpp"
 #include "wvmp/passes/anti_debug/anti_debug_plan.hpp"
 #include "wvmp/regvm/isa/blob.hpp"
 #include "wvmp/regvm/isa/encoding.hpp"
@@ -93,8 +94,32 @@ std::span<const std::string_view> StubLinkPass::provides_keys() const {
 //   - 对外引用仅两类（均为 RVA 相对，随基址平移自洽）：.text→stub 的 E9、
 //     stub→.text 的 resume jmp；节内 blob 指针为 rip 相对（回填）。
 void StubLinkPass::run(ProtectionContext& ctx) {
+    // MIT-542：junk 水印的明文 blob 面核对模式（Error/Warning 二选一的
+    // 统一出口，供"零虚拟化函数"与"块不可见"两条路径共用）。
+    const auto* wm_plan = ctx.find_slot<wm::WatermarkPlan>(kWatermark);
+    const bool wm_junk_face =
+        wm_plan != nullptr && !wm_plan->watermark.dump.empty() &&
+        (wm_plan->mode == wm::WatermarkMode::Junk ||
+         wm_plan->mode == wm::WatermarkMode::Both);
+    const auto wm_report_untraceable = [&](ProtectionContext& c,
+                                           const std::string& msg) {
+        if (wm_plan->mode == wm::WatermarkMode::Junk) {
+            c.diag.report(Severity::Error, name(),
+                          msg + "；拒绝产出不可溯源副本");
+            throw std::runtime_error(std::string(name()) + ": " + msg);
+        }
+        c.diag.report(Severity::Warning, name(),
+                      msg + "（mode=both：padding 面仍在，junk 面冗余降级）");
+    };
+
     const auto* vfs = ctx.find_slot<std::vector<VirtualizedFunction>>(kVmProgram);
     if (vfs == nullptr || vfs->empty()) {
+        // MIT-542：零虚拟化函数 = 无明文 blob 载体。junk 水印配置在场时
+        // 该路径曾是静默断链点（mutate 的 IR 级核对测不到 vfs 为空）。
+        if (wm_junk_face)
+            wm_report_untraceable(
+                ctx, "junk 水印无明文 blob 载体（零虚拟化函数——全部被 "
+                     "gate/C1 拦截或档位为 none），词流里没有水印字节");
         ctx.diag.report(Severity::Warning, name(), "无已虚拟化函数，跳过 stub 生成");
         return;
     }
@@ -447,6 +472,42 @@ void StubLinkPass::run(ProtectionContext& ctx) {
         ctx.slot<std::vector<std::pair<u32, u32>>>(kPatchedRanges)
             .push_back({static_cast<u32>(p.begin_rva),
                         static_cast<u32>(p.end_rva - p.begin_rva)});
+    }
+
+    // MIT-542：junk 水印明文 blob 面核对（**结果级验证**——不追踪"哪个
+    // 函数被 gate"的机制细节，直接验证最终属性：每个 4 字节块在数据节
+    // blob 区按 dump/mask 掩码可见）。背景：x86 白名单 gate（MIT-446 X4）
+    // 会把含未支持 VmOp 的 crypt 豁免载体函数整函数保持原生（无 blob 落
+    // 盘），mutate 已嵌入 IR 的水印块随之不可见——mutate 的 IR 级
+    // fail-closed（每块 ≥1 份）测不到这一层。密文 blob（默认 XorChain 加
+    // 密面）里的块同样不可见，本核对对其一并覆盖。
+    if (wm_junk_face) {
+        const auto chunks = wm::split_fragments(
+            wm_plan->watermark, wm_plan->watermark.dump.size() / 4, 4);
+        if (!chunks.empty()) {
+            const auto present = wm::fragments_present(
+                chunks, data_payload.data(), data_payload.size());
+            size_t missing = 0;
+            std::string miss_idx;
+            for (size_t q = 0; q < chunks.size(); ++q)
+                if (!present[q]) {
+                    ++missing;
+                    if (!miss_idx.empty()) miss_idx += ",";
+                    miss_idx += std::to_string(q);
+                }
+            if (missing > 0) {
+                wm_report_untraceable(
+                    ctx,
+                    "junk 水印有 " + std::to_string(missing) + "/" +
+                        std::to_string(chunks.size()) +
+                        " 块在明文 blob 面不可见（块 " + miss_idx +
+                        "）——载体函数被 gate 保持原生或 blob 未落盘");
+            } else {
+                ctx.diag.report(Severity::Note, name(),
+                                "junk 水印 " + std::to_string(chunks.size()) +
+                                    " 块已在明文 blob 面核实可见");
+            }
+        }
     }
 
     // MIT-476：blob 末端起为 Emit 预留区（预扩零垫）；后续 pass 经

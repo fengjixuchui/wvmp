@@ -1659,3 +1659,6 @@ asmgen 零触碰 → dump 锚不受影响（无换代）。
 
 ### MIT-541 M2 (水印溯源：碎片分散+junk 词流载体+防碰撞) ✅ 2026-10-10
 - 叠枝同分支续做。①padding 碎片：fragments 2-4 均分片多 span 分散，扫描多数票（K≥2 需 ≥ceil(K/2) 且 ≥2 片）；②junk 载体：crypt 豁免函数 junk-Mov imm32（VM 词 aux 高 4 字节 LE 连续），rng 消费序零扰动（水印开/关 junk 位形逐比特一致），映像窗口折条镜像防线（撞窗槽顺延/恒撞窗块 fail-closed），config 三条一致性校验；③are_similar 移植，registry 两两防碰撞。mode(padding/junk/both)+fragments 键转正。ctest 26/26 + E2E 四面（含 junk 真虚拟化行为一致+词流反查）+ 碎片方案 10MB×100 零误报 + 全池 390/390。挂账：x86 gate 可能拦豁免函数（E2E 为 x64，如实披露）。证据链 GAPS「MIT-541 M2」节。
+
+### MIT-542 (junk 水印 x86 兜底核对) ✅ 2026-10-10
+- stub_link 明文 blob 面结果级验证（fragments_present 掩码可见性）：缺块 Junk=Error+抛 / Both=Warning；零 vfs 早退路径同款核对；全可见 Note。单测 +5，ctest 26/26，x86 真样本全链实证（bitops 行为一致+scan 反查 6 命中；池内 x86 样本全 clean，gate 负例 Movsxd 单测钉），全池 390/390。实录：E2E 连跑输出路径覆写乌龙；翻译折叠减损 junk 可见份数（6→3）→ IR 份数与 blob 份数两口径如实披露。证据链 GAPS「MIT-542」节。

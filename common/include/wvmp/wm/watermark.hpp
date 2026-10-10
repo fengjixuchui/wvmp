@@ -130,6 +130,13 @@ struct FragmentScanResult {
 FragmentScanResult scan_fragments(const std::vector<Fragment>& frags,
                                   const u8* data, size_t size);
 
+// 每片在场性：片 i 在 [data, data+size) 中至少一次掩码命中 → out[i]=true。
+// 与 scan_fragments 同一匹配语义，只回答"在不在"（首中即停）。嵌入端
+// 的结果级核对（stub_link 明文 blob 面：每个 junk 块必须真实可见）与
+// 扫描端共用，杜绝两处判定漂移。
+std::vector<bool> fragments_present(const std::vector<Fragment>& frags,
+                                    const u8* data, size_t size);
+
 // 相似水印检测（VMProtect Watermark::AreSimilar 移植）：在 '?' 通配 +
 // 大小写不敏感语义下，若 v1 与 v2 存在"一方包含另一方"的子串关系，视
 // 为过相似——登记表里两枚过相似的水印会产生误归因（泄露副本扫到短片

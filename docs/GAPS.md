@@ -5446,3 +5446,15 @@ config：`[bmi2] require`（默认 true=收白名单，产物契约"最低 BMI2 
 验证：common 单测 +13（切分钉板含 11B 值 3 片必拒的片级下限真约束/多数票 K=2 收紧与 K=3 过半/are_similar 通配窗口）；cli 单测 +14（mode 配置接受面/junk 三条一致性拒绝/相似对拒绝含通配对/scan_file 碎片多数票端到端）；mutate 单测 +4（豁免函数携带/无豁免 fail-closed/rng 序不变/撞窗 fail-closed）；pe_writer 单测 +3（碎片分散可扫回且差异限尾垫+checksum/junk 模式 padding 面 byte-exact/junk 无新节放行）。ctest 26/26（108 gtest in cli_config_and_args）。E2E `watermark_e2e_m2.sh`（snake 真样本）四面：padding 碎片/junk（**真虚拟化+mutate+豁免，保护后行为一致 + scan 从词流反查 Junk_A**）/both/负例（无豁免 rc=1 点名 crypt=false）。v1 E2E 复绿（Note 文案升级 padding 面 N 份 × M 片）。全池 5×78=390 零回踩（M2 未动缺省路径的又一实证）。
 
 ⚠️ 开发实录：①**值长度手数错**——"4D5A9011223344FFAABBCC" 实为 11 字节（22 hex）非 12，碎片测试构造必须按 hex 字符数复核（偶数 hex ≠ 4 的倍数字节，junk 模式 4B 块约束更严）；②**通配对测试值错位**——"??2334" 删了一个字符导致整体错位不相似（通配测试的对照串必须严格等长且仅通配位不同）；③heredoc 里 python `\x`/`\n` 转义经 bash 后语义漂移（M1 已踩，M2 再踩）——**改 C++ 源码一律 Edit 工具直改，python 补丁只用于已验证锚点的机械替换**；④CMake OBJECT 库改链后 ninja 增量不自动 reconfigure，须显式 `cmake -S . -B build`（bat 包装）。局限与挂账：x86 白名单 gate 可能拦掉豁免函数 → junk 嵌了 IR 但函数保持原生无词流（x86 属受限面，E2E 为 x64；如需兜底可在 stub_link gate 处加核对，暂挂账）；碎片片数上限 4 为配置常量（更细分散收益递减）；junk copies 是"尽力"语义（零份 fail-closed、不足份数披露）。
+
+## MIT-542（junk 水印 x86 兜底核对——stub_link 明文 blob 面结果级验证，2026-10-10）落账
+
+交付面 = 分支 `mit-541-watermark` 续枝（水印系列第三单）。清偿 M2 挂账：x86 白名单 gate（MIT-446 X4）把 crypt 豁免载体函数整函数保持原生时，mutate 已嵌入 IR 的水印块无词流落盘——mutate 的 IR 级 fail-closed（每块 ≥1 份）测不到该层，保护"成功"但溯源静默断链。
+
+**设计取结果级验证而非机制级追踪**：不追踪"哪个函数被 gate"，直接验证最终属性——每个 4 字节块在数据节 blob 区按 dump/mask 掩码可见（`wm::fragments_present`，与扫描端同匹配语义防漂移）。机制追踪方案（mutate 记录逐块载体函数 → stub_link 对账 gated[]）被否：翻译期折叠会吃掉部分 junk（实测 bitops 6 放置 6 可见，另一样本 6 放置仅 3 可见——alias/折叠面不可枚举），结果级是唯一不漏的口径。密文 blob（默认 XorChain 加密面）里的块同样不可见，本核对一并覆盖。
+
+接线两处：①vfs 循环后（blob 全部落 data_payload、预留区 resize 前）——缺失块 mode=**Junk**（唯一面）Error+抛（"拒绝产出不可溯源副本"）；mode=**Both**（padding 面仍在）Warning 披露冗余降级；全可见 → Note"已在明文 blob 面核实可见"（E2E 断言锚）。②**零虚拟化函数早退路径**（vfs 空 → 原 Warning+return，核对被跳过 = 相邻静默断链点）——早退前同款核对（mode=Both 的该路径 pe_writer 侧本就 fail-closed"有槽无节"，Junk 则此前完全无防）。
+
+验证：stub_link 单测 +4（x86 全 gate 夹具 Movsxd → Junk 抛错点名"明文 blob 面不可见"/同夹具 Both 只 Warning 不失败/blob 词流两条 Mov aux 恰为块 LE 形 → 核实可见 Note/零 vfs → Junk 抛错）；common 单测 +1（fragments_present 逐片在场/首中即停/空数据）；ctest 26/26；v1+M2 E2E 复绿。**x86 真样本实证**（E2E 此前只有 x64 面）：bitops（index=0 豁免，mutate 2 块×3 份 → stub_link 核实可见 → **行为 stdout+rc 逐字节一致 → scan 反查命中 6 次**，全链闭环）+ sse 两区域正例；asm 标记区域为匿名名（marker@0x677）→ 豁免选择器用 index 而非 name（asm 样本无 WVMP_BEGIN 名串）。池内 x86 样本全部 x86-clean（这正是它们在池的原因），真实"gate 拦载体"负例由单测 Movsxd 确定性覆盖。全池 390/390 第三批零回踩。
+
+实录：①x86 多发连跑时输出路径覆写乌龙——SSE 那发沿用 bitops 的 output 路径，"行为不一致"实为比错对象（**E2E 连跑必须逐发独立 output**，M2 脚本 gen_cfg 按文件名派生路径的设计正是为此，手工配置没享受到）；②翻译期折叠会减损 junk 放置的可见份数（6→3 实测）——mutate 的份数披露是 IR 口径，blob 面真实份数以 stub_link 核对/scan 为准（两口径差异如实记录，不追求对齐——多数票对缺份天然鲁棒）。

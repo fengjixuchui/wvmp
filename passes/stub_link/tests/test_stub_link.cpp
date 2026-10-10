@@ -20,6 +20,7 @@
 #include "wvmp/regvm/isa/blob.hpp"
 #include "wvmp/regvm/isa/encoding.hpp"
 #include "wvmp/vm/backend.hpp"
+#include "wvmp/wm/watermark.hpp"
 
 #include <gtest/gtest.h>
 
@@ -471,3 +472,139 @@ TEST(StubGen, YmmSyncVariantBytes) {
 }
 
 } // namespace
+
+// —— MIT-542：junk 水印明文 blob 面核对 ——————————————————————————————
+
+namespace {
+// 全固定 8 字节值 → 2 个 4 字节块；word 打包与 mutate wm_materialize 同
+// 构（dump[0] = imm 低字节）。
+wvmp::wm::WatermarkPlan make_junk_wm_plan(wvmp::wm::WatermarkMode mode) {
+    wvmp::wm::WatermarkPlan plan;
+    plan.watermark.id = "T";
+    plan.watermark.value = "1122334455667788";
+    plan.watermark.compile();
+    plan.mode = mode;
+    plan.copies = 3;
+    return plan;
+}
+wvmp::u32 wm_chunk_word(const wvmp::wm::Fragment& f) {
+    return wvmp::u32(f.dump[0]) | (wvmp::u32(f.dump[1]) << 8) |
+           (wvmp::u32(f.dump[2]) << 16) | (wvmp::u32(f.dump[3]) << 24);
+}
+} // namespace
+
+TEST(StubLinkPass, WatermarkJunkAllGatedX86FailsClosed) {
+    // x86 白名单 gate 全拦（Movsxd 未支持）→ 无 blob 落盘 → junk 块全
+    // 不可见 → mode=Junk 硬失败（M2 挂账的 x86 兜底核对）。
+    auto ctx = make_ctx_with_one_function();
+    {
+        PeImage meta = ctx.slot<PeImage>(wvmp::kPeImage);
+        meta.machine = 0x014C;
+        meta.is_pe32_plus = false;
+        ctx.slot<PeImage>(wvmp::kPeImage) = meta;
+    }
+    {
+        std::vector<u8> stream;
+        isa::append_insn(stream, isa::make_insn(isa::VmOp::Movsxd, isa::OpKind::Reg,
+                                                0, isa::OpKind::Reg, 1, 0, 3));
+        isa::append_insn(stream, isa::make_insn(isa::VmOp::Halt, isa::OpKind::None, 0,
+                                                isa::OpKind::None, 0));
+        const auto blob = isa::make_blob(wvmp::ir::Arch::X86, 0, std::move(stream));
+        std::vector<u8> serialized;
+        wvmp::ByteWriter w(serialized);
+        isa::write_blob(w, blob);
+        ctx.slot<std::vector<VirtualizedFunction>>(wvmp::kVmProgram)
+            .front()
+            .program.bytecode = std::move(serialized);
+    }
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) =
+        make_junk_wm_plan(wvmp::wm::WatermarkMode::Junk);
+
+    wvmp::passes::StubLinkPass pass;
+    EXPECT_THROW(pass.run(ctx), std::runtime_error);
+    EXPECT_TRUE(ctx.diag.has_errors());
+    bool msg_found = false;
+    for (const auto& d : ctx.diag.items())
+        if (d.message.find("明文 blob 面不可见") != std::string::npos)
+            msg_found = true;
+    EXPECT_TRUE(msg_found);
+}
+
+TEST(StubLinkPass, WatermarkBothAllGatedX86WarnsNotFails) {
+    // mode=Both：junk 面降级只披露不失败（padding 面仍由 pe_writer 嵌）。
+    auto ctx = make_ctx_with_one_function();
+    {
+        PeImage meta = ctx.slot<PeImage>(wvmp::kPeImage);
+        meta.machine = 0x014C;
+        meta.is_pe32_plus = false;
+        ctx.slot<PeImage>(wvmp::kPeImage) = meta;
+    }
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) =
+        make_junk_wm_plan(wvmp::wm::WatermarkMode::Both);
+
+    wvmp::passes::StubLinkPass pass;
+    EXPECT_NO_THROW(pass.run(ctx));
+    EXPECT_FALSE(ctx.diag.has_errors());
+    bool warned = false;
+    for (const auto& d : ctx.diag.items())
+        if (d.severity == wvmp::Severity::Warning &&
+            d.message.find("明文 blob 面不可见") != std::string::npos)
+            warned = true;
+    EXPECT_TRUE(warned);
+}
+
+TEST(StubLinkPass, WatermarkJunkVisibleInBlobNoted) {
+    // 正例：blob 词流里两条 Mov 的 aux 恰为两块的 LE 形 → 核对通过 +
+    // Note 披露"核实可见"（E2E 断言锚）。
+    auto ctx = make_ctx_with_one_function();
+    const wvmp::wm::WatermarkPlan plan =
+        make_junk_wm_plan(wvmp::wm::WatermarkMode::Junk);
+    const auto chunks = wvmp::wm::split_fragments(
+        plan.watermark, plan.watermark.dump.size() / 4, 4);
+    ASSERT_EQ(chunks.size(), 2u);
+    {
+        std::vector<u8> stream;
+        isa::append_insn(stream,
+                         isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, 2,
+                                        isa::OpKind::Imm, 0, wm_chunk_word(chunks[0]),
+                                        0));
+        isa::append_insn(stream,
+                         isa::make_insn(isa::VmOp::Mov, isa::OpKind::Reg, 3,
+                                        isa::OpKind::Imm, 0, wm_chunk_word(chunks[1]),
+                                        0));
+        isa::append_insn(stream, isa::make_insn(isa::VmOp::Halt, isa::OpKind::None, 0,
+                                                isa::OpKind::None, 0));
+        const auto blob = isa::make_blob(wvmp::ir::Arch::X64, 0, std::move(stream));
+        std::vector<u8> serialized;
+        wvmp::ByteWriter w(serialized);
+        isa::write_blob(w, blob);
+        ctx.slot<std::vector<VirtualizedFunction>>(wvmp::kVmProgram)
+            .front()
+            .program.bytecode = std::move(serialized);
+    }
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) = plan;
+
+    wvmp::passes::StubLinkPass pass;
+    EXPECT_NO_THROW(pass.run(ctx));
+    EXPECT_FALSE(ctx.diag.has_errors());
+    bool noted = false;
+    for (const auto& d : ctx.diag.items())
+        if (d.message.find("明文 blob 面核实可见") != std::string::npos)
+            noted = true;
+    EXPECT_TRUE(noted);
+}
+
+TEST(StubLinkPass, WatermarkJunkNoVfsFailsClosed) {
+    // 零虚拟化函数：stub_link 提前 return 路径曾是静默断链点（核对被
+    // 跳过）——MIT-542 在早退前补核对。
+    ProtectionContext ctx;
+    ctx.image = build_pe_with_region();
+    ctx.slot<PeImage>(wvmp::kPeImage) =
+        wvmp::passes::parse_pe_image(ctx.image);
+    ctx.slot<wvmp::wm::WatermarkPlan>(wvmp::kWatermark) =
+        make_junk_wm_plan(wvmp::wm::WatermarkMode::Junk);
+
+    wvmp::passes::StubLinkPass pass;
+    EXPECT_THROW(pass.run(ctx), std::runtime_error);
+    EXPECT_TRUE(ctx.diag.has_errors());
+}

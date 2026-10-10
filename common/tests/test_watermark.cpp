@@ -372,3 +372,29 @@ TEST(AreSimilar, EmptyIsSimilar) {
     EXPECT_TRUE(wvmp::wm::are_similar("", "4D5A9011"));
     EXPECT_TRUE(wvmp::wm::are_similar("4D5A9011", ""));
 }
+
+// —— MIT-542：每片在场性（stub_link 明文 blob 面核对的原语）——
+TEST(FragmentsPresent, PerFragmentPresence) {
+    const auto wm = make_wm("A", "4D5A9011223344FF");
+    const auto frags = wvmp::wm::split_fragments(wm, 2, 4);
+    ASSERT_EQ(frags.size(), 2u);
+    // 只放片 0 → present = {true,false}；两片都放 → 全 true；空数据 →
+    // 全 false。
+    std::vector<wvmp::u8> only0{0x4D, 0x5A, 0x90, 0x11};
+    auto p = wvmp::wm::fragments_present(frags, only0.data(), only0.size());
+    ASSERT_EQ(p.size(), 2u);
+    EXPECT_TRUE(p[0]);
+    EXPECT_FALSE(p[1]);
+
+    std::vector<wvmp::u8> both;
+    both.insert(both.end(), {0x4D, 0x5A, 0x90, 0x11});
+    both.push_back(0x00);
+    both.insert(both.end(), {0x22, 0x33, 0x44, 0xFF});
+    p = wvmp::wm::fragments_present(frags, both.data(), both.size());
+    EXPECT_TRUE(p[0]);
+    EXPECT_TRUE(p[1]);
+
+    p = wvmp::wm::fragments_present(frags, only0.data(), 0);
+    EXPECT_FALSE(p[0]);
+    EXPECT_FALSE(p[1]);
+}

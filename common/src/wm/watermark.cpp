@@ -185,8 +185,7 @@ std::vector<Fragment> split_fragments(const Watermark& wm, size_t target_count,
 }
 
 FragmentScanResult scan_fragments(const std::vector<Fragment>& frags,
-                                  const u8* data, size_t size) {
-    FragmentScanResult r;
+                                  const u8* data, size_t size) {    FragmentScanResult r;
     r.fragments_total = frags.size();
     if (frags.empty()) return r;
     for (const Fragment& f : frags) {
@@ -216,6 +215,20 @@ FragmentScanResult scan_fragments(const std::vector<Fragment>& frags,
         r.identified = r.fragments_hit >= (r.fragments_total + 1) / 2 &&
                        r.fragments_hit >= 2;
     return r;
+}
+
+std::vector<bool> fragments_present(const std::vector<Fragment>& frags,
+                                    const u8* data, size_t size) {
+    std::vector<bool> out(frags.size(), false);
+    for (size_t k = 0; k < frags.size(); ++k) {
+        Watermark view;
+        view.dump = frags[k].dump;
+        view.mask = frags[k].mask;
+        StreamMatcher m(view);
+        for (size_t off = 0; off < size && !out[k]; ++off)
+            if (m.feed(data[off])) out[k] = true;  // 首中即停
+    }
+    return out;
 }
 
 bool are_similar(std::string_view v1, std::string_view v2) {
